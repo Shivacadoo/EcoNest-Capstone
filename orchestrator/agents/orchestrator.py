@@ -1,0 +1,622 @@
+"""Task orchestrator that routes tasks to the appropriate agent."""
+
+import asyncio
+import uuid
+from collections.abc import Callable, Sequence
+from datetime import datetime
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+from orchestrator.agents.base import BaseAgent, Result, Task
+from orchestrator.agents.device_agent import DeviceAgent
+from orchestrator.agents.energy_agent import EnergyAgent
+from orchestrator.agents.irrigation_agent import IrrigationAgent
+from orchestrator.agents.security_agent import SecurityAgent
+from orchestrator.agents.sensor_agent import SensorAgent
+from orchestrator.core.audit import write_audit_event, write_audit_event_async
+from orchestrator.core.permissions import Role, normalize_role
+from orchestrator.core.policy import evaluate_autonomous_action_policy
+from orchestrator.llm.client import LLMClient
+from orchestrator.llm.models import LLMMessage
+from orchestrator.mcp.executor import MCPToolExecutor
+
+MAX_RETRIES = 3
+NIGHT_CONTROL_START_HOUR = 23
+NIGHT_CONTROL_END_HOUR = 6
+MIN_LLM_CLASSIFICATION_CONFIDENCE = 0.45
+
+
+class IntentClassification(BaseModel):
+    """LLM output for intent routing."""
+
+    category: str = Field(pattern="^(energy|security|irrigation|sensor|device|multi|unknown)$")
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
+    reasoning: str = ""
+
+
+INTENT_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "energy": ("energy", "power", "efficiency", "pricing", "schedule"),
+    "security": ("security", "motion", "intrusion", "alert", "garage"),
+    "irrigation": ("irrigation", "sprinkler", "watering"),
+    "sensor": ("sensor", "health", "calibration", "offline"),
+    "device": ("device", "turn on", "turn off", "dim", "light", "switch"),
+}
+
+DEVICE_CONTROL_KEYWORDS = (
+    "device",
+    "turn on",
+    "turn off",
+    "dim",
+    "light",
+    "switch",
+    "brightness",
+    "open",
+    "close",
+)
+SMS_KEYWORDS = ("sms", "text message", "send text", "notify phone")
+
+
+class AgentOrchestrator:
+    """Routes incoming tasks to the correct agent and manages lifecycle."""
+
+    def __init__(
+        self,
+        agents: Sequence[BaseAgent] | None = None,
+        llm: LLMClient | None = None,
+        current_hour_provider: Callable[[], int] | None = None,
+        tool_executor: MCPToolExecutor | None = None,
+    ) -> None:
+        self._stats = {
+            "submitted": 0,
+            "completed": 0,
+            "failed": 0,
+        }
+        self.agents = list(
+            agents
+            or [
+                EnergyAgent(),
+                SecurityAgent(),
+                IrrigationAgent(),
+                SensorAgent(),
+                DeviceAgent(),
+            ]
+        )
+        self.llm = llm or LLMClient()
+        self.tool_executor = tool_executor or MCPToolExecutor()
+        self.current_hour_provider = current_hour_provider or (
+            lambda: datetime.now().hour
+        )
+        self._tasks: dict[str, asyncio.Task[Any]] = {}
+        self._results: dict[str, Result] = {}
+
+    def stats(self) -> dict[str, int]:
+        return dict(self._stats)
+
+    async def submit_http_api(
+        self,
+        intent: str,
+        payload: dict[str, Any] | None = None,
+        user_id: str = "",
+        user_role: str = "",
+        timeout_seconds: int = 30,
+    ) -> str:
+        """Submit a task received through the authenticated HTTP API."""
+        return await self.submit(
+            Task(
+                intent=intent,
+                payload=payload or {},
+                user_id=user_id,
+                timeout_seconds=timeout_seconds,
+                metadata={"source": "http_api", "user_role": user_role},
+            )
+        )
+
+    async def submit_scheduled(
+        self,
+        intent: str,
+        payload: dict[str, Any] | None = None,
+        schedule_id: str = "",
+        timeout_seconds: int = 30,
+    ) -> str:
+        """Submit a task created by a scheduled job."""
+        return await self.submit(
+            Task(
+                intent=intent,
+                payload=payload or {},
+                timeout_seconds=timeout_seconds,
+                metadata={"source": "scheduled_cron", "schedule_id": schedule_id},
+            )
+        )
+
+    async def submit_home_assistant_webhook(
+        self,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+        timeout_seconds: int = 30,
+    ) -> str:
+        """Submit a task created by a Home Assistant webhook/event."""
+        event_payload = payload or {}
+        intent = str(event_payload.get("intent") or event_type)
+        return await self.submit(
+            Task(
+                intent=intent,
+                payload=event_payload,
+                timeout_seconds=timeout_seconds,
+                metadata={"source": "ha_webhook", "event_type": event_type},
+            )
+        )
+
+    async def submit(self, task: Task) -> str:
+        """Submit a task and return a task ID."""
+        task = task.model_copy(update={"id": task.id or str(uuid.uuid4())})
+        write_audit_event(
+            "task.submitted",
+            {
+                "task_id": task.id,
+                "intent": task.intent,
+                "user_id": task.user_id,
+                "metadata": task.metadata,
+                "payload": _audit_payload(task.payload),
+            },
+        )
+        running_task = asyncio.create_task(self._run_with_lifecycle(task))
+        self._tasks[task.id] = running_task
+        self._stats["submitted"] += 1
+        running_task.add_done_callback(lambda _: self._tasks.pop(task.id, None))
+        return task.id
+
+    async def _run_with_lifecycle(self, task: Task) -> None:
+        """Run task with timeout, retry, and result storage."""
+        policy_result = await self._enforce_global_policy(task)
+        if policy_result is not None:
+            self._results[task.id] = policy_result
+            await self._audit_task_result(task, policy_result, policy_blocked=True)
+            if self._is_device_control_task(task):
+                await self._log_device_control_to_graph(task, policy_result)
+            return
+
+        agents = await self._select_agents(task)
+        if not agents:
+            result = Result(
+                success=False,
+                data={},
+                message="No agent could handle this task",
+                task_id=task.id,
+                error="no_agent",
+            )
+            self._results[task.id] = result
+            await self._audit_task_result(task, result)
+            return
+
+        results = await asyncio.gather(
+            *(self._run_agent_with_retries(agent, task) for agent in agents)
+        )
+        result = self._aggregate_results(task, results)
+        if result.success:
+            self._stats["completed"] += 1
+        else:
+            self._stats["failed"] += 1
+
+        if self._is_device_control_task(task):
+            await self._log_device_control_to_graph(task, result)
+        await self._audit_task_result(task, result)
+        await self._audit_energy_recommendations(task, result)
+        await self._audit_security_recommendations(task, result)
+        await self._audit_irrigation_recommendations(task, result)
+        self._results[task.id] = result
+
+    async def _run_agent_with_retries(self, agent: BaseAgent, task: Task) -> Result:
+        routed_task = task.model_copy(
+            update={"metadata": {**task.metadata, "routed_agent": agent.name}}
+        )
+        for attempt in range(MAX_RETRIES):
+            try:
+                result = await asyncio.wait_for(
+                    agent.execute(routed_task),
+                    timeout=routed_task.timeout_seconds,
+                )
+                if (
+                    result.success
+                    or result.error == "unsupported_task"
+                    or attempt == MAX_RETRIES - 1
+                ):
+                    return result
+            except asyncio.TimeoutError:
+                if attempt == MAX_RETRIES - 1:
+                    return Result(
+                        success=False,
+                        data={},
+                        message=f"Task timed out after {routed_task.timeout_seconds}s",
+                        agent=agent.name,
+                        task_id=routed_task.id,
+                        error="timeout",
+                    )
+            except Exception as exc:
+                if attempt == MAX_RETRIES - 1:
+                    return Result(
+                        success=False,
+                        data={},
+                        message=f"Task failed: {exc}",
+                        agent=agent.name,
+                        task_id=routed_task.id,
+                        error=exc.__class__.__name__,
+                    )
+        return Result(
+            success=False,
+            data={},
+            message="Task failed after retries",
+            agent=agent.name,
+            task_id=routed_task.id,
+            error="retry_exhausted",
+        )
+
+    async def _classify_and_route(self, task: Task) -> BaseAgent | None:
+        """Classify intent and route to the best agent."""
+        agents = await self._select_agents(task, aggregate=False)
+        return agents[0] if agents else None
+
+    async def _select_agents(
+        self,
+        task: Task,
+        aggregate: bool = True,
+    ) -> list[BaseAgent]:
+        """Classify intent and return one or more capable agents."""
+        routed_agent = str(task.metadata.get("routed_agent", ""))
+        if routed_agent:
+            selected = next(
+                (agent for agent in self.agents if agent.name == routed_agent), None
+            )
+            if selected is not None:
+                return [selected]
+        if self._should_aggregate(task) and aggregate:
+            capable_agents = [
+                agent for agent in self.agents if await agent.can_handle(task)
+            ]
+            return capable_agents or list(self.agents)
+
+        category = await self._classify_intent(task)
+        if category != "unknown":
+            agent = await self._agent_for_category(task, category)
+            if agent is not None:
+                return [agent]
+
+        for agent in self.agents:
+            if await agent.can_handle(task):
+                return [agent]
+        return []
+
+    async def _classify_intent(self, task: Task) -> str:
+        """Classify intent with LLM first and deterministic rules as fallback."""
+        llm_category = await self._classify_intent_with_llm(task)
+        if llm_category != "unknown":
+            return llm_category
+
+        return self._classify_intent_with_rules(task)
+
+    async def _classify_intent_with_llm(self, task: Task) -> str:
+        """Use the local LLM as the primary intent classifier."""
+        try:
+            classification = await self.llm.generate_structured(
+                [
+                    LLMMessage(
+                        role="user",
+                        content=(
+                            "Classify this smart-home task into exactly one category: "
+                            "energy, security, irrigation, sensor, device, multi, or unknown.\n\n"
+                            "Use the payload as the strongest signal. "
+                            "If the payload asks for a concrete device action such as "
+                            "turn_on, turn_off, set_brightness, open, close, or includes "
+                            "a controllable domain like light or switch, classify it as "
+                            "device even if the text also mentions motion or security.\n\n"
+                            f"Intent: {task.intent}\n"
+                            f"Payload: {task.payload}\n"
+                            f"Metadata: {task.metadata}"
+                        ),
+                    )
+                ],
+                IntentClassification,
+                temperature=0.0,
+            )
+        except Exception:
+            return "unknown"
+
+        if classification.confidence < MIN_LLM_CLASSIFICATION_CONFIDENCE:
+            return "unknown"
+        return classification.category
+
+    def _classify_intent_with_rules(self, task: Task) -> str:
+        """Deterministic fallback when LLM classification is unavailable."""
+        if self._is_device_control_task(task):
+            return "device"
+        intent_lower = task.intent.lower()
+        for category, keywords in INTENT_KEYWORDS.items():
+            if any(kw in intent_lower for kw in keywords):
+                return category
+        return "unknown"
+
+    async def _agent_for_category(
+        self,
+        _task: Task,
+        category: str,
+    ) -> BaseAgent | None:
+        for agent in self.agents:
+            if agent.name == category:
+                return agent
+        return None
+
+    async def get_result(self, task_id: str) -> Result | None:
+        """Get the result for a task (None if still running)."""
+        return self._results.get(task_id)
+
+    async def healthcheck(self) -> dict[str, Any]:
+        """Healthcheck all registered agents."""
+        return {
+            agent.name: (await agent.healthcheck()).model_dump()
+            for agent in self.agents
+        }
+
+    def _should_aggregate(self, task: Task) -> bool:
+        route = task.metadata.get("route")
+        if route in {"all", "multi"}:
+            return True
+        aggregate = task.metadata.get("aggregate")
+        if isinstance(aggregate, bool):
+            return aggregate
+        intent_lower = task.intent.lower()
+        return any(word in intent_lower for word in ("overview", "summary", "status"))
+
+    def _aggregate_results(self, task: Task, results: Sequence[Result]) -> Result:
+        if len(results) == 1:
+            return results[0]
+
+        successful = [result for result in results if result.success]
+        return Result(
+            success=bool(successful) and len(successful) == len(results),
+            data={
+                "results": [
+                    {
+                        "agent": result.agent,
+                        "success": result.success,
+                        "data": result.data,
+                        "message": result.message,
+                        "error": result.error,
+                    }
+                    for result in results
+                ]
+            },
+            message=f"Aggregated {len(results)} agent results",
+            task_id=task.id,
+            metadata={
+                "agents": [result.agent for result in results if result.agent],
+                "successful_agents": [
+                    result.agent for result in successful if result.agent
+                ],
+            },
+        )
+
+    async def _audit_task_result(
+        self,
+        task: Task,
+        result: Result,
+        policy_blocked: bool = False,
+    ) -> None:
+        await write_audit_event_async(
+            "task.completed",
+            {
+                "task_id": task.id,
+                "intent": task.intent,
+                "user_id": task.user_id,
+                "success": result.success,
+                "agent": result.agent,
+                "message": result.message,
+                "error": result.error,
+                "confidence": result.confidence,
+                "policy_blocked": policy_blocked,
+                "metadata": result.metadata,
+                "payload": _audit_payload(task.payload),
+                "expected_outcome": task.payload.get("expected_outcome")
+                or task.metadata.get("expected_outcome"),
+                "actual_outcome": result.metadata.get("actual_outcome")
+                or result.metadata.get("verified"),
+            },
+        )
+
+    async def _audit_energy_recommendations(self, task: Task, result: Result) -> None:
+        """Persist each user-requested energy recommendation for the activity feed."""
+        if (
+            not result.success
+            or result.agent != "energy"
+            or not isinstance(result.data, dict)
+        ):
+            return
+        recommendations = result.data.get("recommendations")
+        if not isinstance(recommendations, list):
+            return
+        normalized = [item for item in recommendations if isinstance(item, dict)]
+        if not normalized:
+            return
+        await write_audit_event_async(
+            "energy.recommendations.generated",
+            {
+                "task_id": task.id,
+                "agent": "energy",
+                "source": task.metadata.get("source", "direct"),
+                "recommendation_only": True,
+                "recommendations": normalized,
+                "pricing": result.data.get("pricing"),
+                "household_routines": result.data.get("household_routines", []),
+            },
+        )
+
+    async def _audit_security_recommendations(self, task: Task, result: Result) -> None:
+        """Persist advisory security assessments for the recommendation activity feed."""
+        if not result.success or result.agent != "security" or not isinstance(result.data, dict):
+            return
+        items = result.data.get("recommendations")
+        if not isinstance(items, list):
+            items = []
+        recommendations = [item for item in items if isinstance(item, str) and item]
+        incidents = result.data.get("incidents")
+        if not isinstance(incidents, list):
+            incidents = []
+        incident_reasons = [
+            str(item.get("reason"))
+            for item in incidents
+            if isinstance(item, dict) and item.get("reason")
+        ]
+        action = recommendations[0] if recommendations else "Continue normal security monitoring"
+        reasoning = "; ".join(incident_reasons) or "No security anomaly was detected in the current assessment."
+        await write_audit_event_async(
+            "security.recommendations.generated",
+            {
+                "task_id": task.id,
+                "agent": "security",
+                "source": task.metadata.get("source", "direct"),
+                "recommendation_only": True,
+                "recommendations": [
+                    {
+                        "priority": result.data.get("severity", "LOW"),
+                        "action": action,
+                        "reasoning": reasoning,
+                    }
+                ],
+            },
+        )
+
+    async def _audit_irrigation_recommendations(self, task: Task, result: Result) -> None:
+        """Persist advisory irrigation reviews for the recommendation activity feed."""
+        if not result.success or result.agent != "irrigation" or not isinstance(result.data, dict):
+            return
+        items = result.data.get("recommendations")
+        if not isinstance(items, list):
+            return
+        recommendations = [item for item in items if isinstance(item, dict)]
+        if not recommendations:
+            return
+        await write_audit_event_async(
+            "irrigation.recommendations.generated",
+            {
+                "task_id": task.id,
+                "agent": "irrigation",
+                "source": task.metadata.get("source", "direct"),
+                "recommendation_only": True,
+                "recommendations": recommendations,
+            },
+        )
+
+    async def _enforce_global_policy(self, task: Task) -> Result | None:
+        action_policy = evaluate_autonomous_action_policy(
+            task.payload,
+            task.metadata,
+            self._is_device_control_task(task),
+        )
+        if not action_policy.allowed:
+            return Result(
+                success=False,
+                data={},
+                message=action_policy.reason,
+                task_id=task.id,
+                error="policy_autonomous_action_restricted",
+                metadata={
+                    "source": task.metadata.get("source") or task.payload.get("source"),
+                    "expected_outcome": task.payload.get("expected_outcome"),
+                },
+            )
+
+        role = self._task_role(task)
+        if self._is_device_control_task(task) and self._is_restricted_control_hour():
+            if role not in {Role.HOMEOWNER, Role.SUPERADMIN}:
+                return Result(
+                    success=False,
+                    data={},
+                    message="Device control is restricted between 11pm and 6am",
+                    task_id=task.id,
+                    error="policy_device_control_quiet_hours",
+                    metadata={"role": role.value if role else None},
+                )
+
+        if self._is_sms_task(task) and role in {Role.GUEST, Role.FAMILY_MEMBER}:
+            return Result(
+                success=False,
+                data={},
+                message="SMS actions are not allowed for guest or family_member roles",
+                task_id=task.id,
+                error="policy_sms_role_restricted",
+                metadata={"role": role.value if role else None},
+            )
+        return None
+
+    def _task_role(self, task: Task) -> Role | None:
+        role = task.metadata.get("user_role") or task.payload.get("user_role")
+        return normalize_role(str(role)) if role else None
+
+    def _is_restricted_control_hour(self) -> bool:
+        hour = self.current_hour_provider()
+        return hour >= NIGHT_CONTROL_START_HOUR or hour < NIGHT_CONTROL_END_HOUR
+
+    def _is_device_control_task(self, task: Task) -> bool:
+        action = str(task.payload.get("action", "")).lower()
+        domain = str(task.payload.get("domain", "")).lower()
+        intent = task.intent.lower()
+        return (
+            domain in {"device", "light", "switch", "cover", "climate", "fan"}
+            or action
+            in {
+                "turn_on",
+                "turn_off",
+                "toggle",
+                "set_brightness",
+                "open",
+                "close",
+                "set_temperature",
+            }
+            or any(keyword in intent for keyword in DEVICE_CONTROL_KEYWORDS)
+        )
+
+    def _is_sms_task(self, task: Task) -> bool:
+        channel = str(task.payload.get("channel", "")).lower()
+        action = str(task.payload.get("action", "")).lower()
+        intent = task.intent.lower()
+        return (
+            channel == "sms"
+            or action in {"send_sms", "sms"}
+            or any(keyword in intent for keyword in SMS_KEYWORDS)
+        )
+
+    async def _log_device_control_to_graph(self, task: Task, result: Result) -> None:
+        try:
+            await self.tool_executor.execute(
+                "record_device_action",
+                {
+                    "action": str(task.payload.get("action") or task.intent),
+                    "task_id": task.id,
+                    "user_id": task.user_id,
+                    "success": result.success,
+                },
+                role=Role.SERVICE_ACCOUNT,
+                task_id=task.id,
+                agent="orchestrator",
+                source=str(task.metadata.get("source", "orchestrator")),
+            )
+        except Exception:
+            return
+
+
+def _audit_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep audit payloads useful without logging large or sensitive blobs."""
+    allowed_keys = {
+        "action",
+        "baseline_w",
+        "current_power_w",
+        "device_id",
+        "domain",
+        "entity_id",
+        "event_type",
+        "room",
+        "temperature",
+        "trigger",
+        "type",
+        "expected_outcome",
+    }
+    return {key: payload[key] for key in allowed_keys if key in payload}

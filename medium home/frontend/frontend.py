@@ -7,7 +7,10 @@ import os
 from dotenv import load_dotenv
 
 
-load_dotenv()
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_ENV = os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".env"))
+load_dotenv(ROOT_ENV)
+load_dotenv(override=False)
 
 
 # ── Configuration ──────────────────────────────────────────────
@@ -19,7 +22,10 @@ if not HA_TOKEN:
     raise ValueError("HA_TOKEN not found in .env file — please add it")
 
 
-BACKEND_URL = "http://127.0.0.1:5000/readings/add"
+ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://127.0.0.1:8001").rstrip("/")
+BACKEND_URL = os.getenv("BACKEND_URL", f"{ORCHESTRATOR_URL}/readings/add")
+SERVICE_ACCOUNT_TOKEN = os.getenv("SERVICE_ACCOUNT_TOKEN")
+LEGACY_API_KEY = os.getenv("LEGACY_API_KEY")
 
 
 # Device IDs (home_id: 3 — Professor's House)
@@ -86,13 +92,27 @@ HA_HEADERS = {
 }
 
 
+BACKEND_HEADERS = {"Content-Type": "application/json"}
+if SERVICE_ACCOUNT_TOKEN:
+    BACKEND_HEADERS["Authorization"] = f"Bearer {SERVICE_ACCOUNT_TOKEN}"
+elif LEGACY_API_KEY:
+    BACKEND_HEADERS["X-API-Key"] = LEGACY_API_KEY
+
+BACKEND_HEADERS["X-Service-Name"] = "frontend"
+
+
 last_motion_state = None
 
 
 # ── Helpers ────────────────────────────────────────────────────
 def post_readings(payload):
     try:
-        resp = requests.post(BACKEND_URL, json=payload, timeout=5)
+        resp = requests.post(
+            BACKEND_URL,
+            json=payload,
+            headers=BACKEND_HEADERS,
+            timeout=5,
+        )
         return resp.json()
     except requests.RequestException as e:
         print(f"  [ERROR] Backend unreachable: {e}")
@@ -249,4 +269,3 @@ if __name__ == "__main__":
 
     while True:
         time.sleep(1)
-

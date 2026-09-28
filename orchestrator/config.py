@@ -1,0 +1,94 @@
+"""Pydantic Settings with .env support for the EcoNest orchestrator."""
+
+from functools import lru_cache
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Application settings loaded from environment variables and .env file."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    VERSION: str = "0.1.0"
+
+    # ArcadeDB
+    ARCADEDB_HOST: str = "localhost"
+    ARCADEDB_PORT: int = 2480
+    ARCADEDB_USER: str = "root"
+    ARCADEDB_PASSWORD: str = "playwithdata"
+    ARCADEDB_DATABASE: str = "econest"
+
+    # MySQL
+    MYSQL_HOST: str = "localhost"
+    MYSQL_PORT: int = 3306
+    MYSQL_USER: str = "root"
+    MYSQL_PASSWORD: str = "econest"
+    MYSQL_DATABASE: str = "econest"
+    MYSQL_POOL_SIZE: int = 10
+
+    # Ollama / LLM
+    OLLAMA_URL: str = "http://localhost:11434"
+    OLLAMA_MODEL: str = "gemma3:4b"
+    OLLAMA_FALLBACK_MODEL: str = "gemma3:4b"
+    OLLAMA_TIMEOUT_SECONDS: int = 180
+
+    # Home Assistant
+    HA_URL: str = "http://localhost:8123"
+    HA_TOKEN: str = ""
+    HA_REGISTRY_SOURCE: str = "live"
+    HA_INGEST_ENABLED: bool = False
+    HA_INGEST_INTERVAL_SECONDS: int = 60
+    HA_STATISTICS_SYNC_INTERVAL_SECONDS: int = 3600
+    HA_STATISTICS_SYNC_LOOKBACK_DAYS: int = 3
+    COMFORT_OBSERVATION_INTERVAL_SECONDS: int = 300
+    WEATHER_FORECAST_REFRESH_SECONDS: int = 3600
+    HOME_LATITUDE: float | None = None
+    HOME_LONGITUDE: float | None = None
+    HA_EVENT_DISPATCH_ENABLED: bool = True
+    HA_EVENT_DISPATCH_COOLDOWN_SECONDS: int = 300
+    HA_REGISTRY_REFRESH_SECONDS: int = 300
+    GRAPH_SYNC_ENABLED: bool = True
+    GRAPH_SYNC_INTERVAL_SECONDS: int = 300
+    GRAPH_SYNC_INITIAL_LOOKBACK_SECONDS: int = 0
+    DEVICE_CAPABILITY_FAIL_CLOSED: bool = False
+
+    # Security
+    SECRET_KEY: str = "change-me-in-production"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    ALGORITHM: str = "HS256"
+    COMMAND_CENTER_AUTH_REQUIRED: bool = True
+
+    # Orchestrator
+    ORCHESTRATOR_URL: str = ""
+    AUDIT_LOG_ENABLED: bool = True
+    AUDIT_LOG_PATH: str = "logs/audit.jsonl"
+    AUDIT_LOG_MAX_BYTES: int = 10_485_760
+    AUDIT_LOG_BACKUP_COUNT: int = 5
+    AUTONOMY_RECOMMENDATION_HISTORY_EVENTS: int = 10_000
+    AUTONOMY_MONITOR_ENABLED: bool = False
+    AUTONOMY_MONITOR_INTERVAL_SECONDS: int = 300
+    AUTONOMY_MONITOR_RUN_ON_STARTUP: bool = True
+    AUTONOMY_RECOMMENDATIONS_ENABLED: bool = True
+    AUTONOMY_RECOMMENDATION_INTERVAL_SECONDS: int = 600
+    AUTONOMY_ACTIONS_ENABLED: bool = False
+    AUTONOMY_ACTION_CONFIDENCE_THRESHOLD: float = 0.85
+    AUTONOMY_ALLOWED_ACTIONS: str = "light.turn_off,light.turn_on"
+    AUTONOMY_ALLOWED_ENTITIES: str = ""
+
+    # Energy recommendations
+    ENERGY_HISTORY_LOOKBACK_DAYS: int = 28
+    ENERGY_HISTORY_MAX_SAMPLES: int = 1_000
+    ANALYTICS_LOOKBACK_DAYS: int = 365
+    HOUSEHOLD_ELECTRICITY_PROVIDER: str = ""
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """Return cached Settings instance."""
+    return Settings()

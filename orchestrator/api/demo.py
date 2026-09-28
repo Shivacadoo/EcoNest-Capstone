@@ -1,0 +1,1805 @@
+"""Professor-facing live demo routes."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
+
+import httpx
+from fastapi import APIRouter, HTTPException, status
+from fastapi.responses import HTMLResponse, StreamingResponse
+from pydantic import BaseModel, Field
+
+from orchestrator.agents.base import Result, Task
+from orchestrator.agents.orchestrator import AgentOrchestrator
+from orchestrator.config import get_settings
+from orchestrator.core.audit import (
+    read_recent_audit_events,
+    summarize_audit_events,
+    write_audit_event_async,
+)
+from orchestrator.core.database import healthcheck_arcadedb, healthcheck_mysql
+from orchestrator.core.permissions import Role
+from orchestrator.llm.client import LLMClient
+from orchestrator.llm.models import LLMMessage
+from orchestrator.mcp.tools.ha_tools import HAGetStateInput, ha_get_state_handler
+
+router = APIRouter(prefix="/demo", tags=["demo"])
+settings = get_settings()
+_demo_orchestrator = AgentOrchestrator()
+_feedback_memory: dict[str, Any] = {
+    "last_occupancy": None,
+    "transitions": [],
+    "observation_count": 0,
+}
+
+DEMO_ACCESS_CODE = "Demo1"
+DEMO2_ACCESS_CODE = "Demo2"
+DEMO3_ACCESS_CODE = "Demo3"
+DEMO4_ACCESS_CODE = "Demo4"
+DEMO_MEDIA_LIGHT_ENTITY = "light.upstairs_media_light_1"
+DEMO_MEDIA_THERMOSTAT_ENTITY = "climate.media_room"
+DEMO_MEDIA_TEMPERATURE_SENSOR = "sensor.media_room_temperature"
+DEMO_MEDIA_HUMIDITY_SENSOR = "sensor.media_room_humidity"
+DEMO_SPRINKLER_ENTITY = "switch.back_lawn_automatic_watering"
+DEMO_GARAGE_ENTITY = "cover.garage12"
+DEMO_POLL_INTERVAL_SECONDS = 0.4
+DEMO_MAX_POLLS = 75
+DEMO_THERMOSTAT_MIN_SETPOINT = 74.0
+DEMO_THERMOSTAT_MAX_SETPOINT = 80.0
+
+
+class DemoRequest(BaseModel):
+    code: str
+
+
+class ThermostatReasoning(BaseModel):
+    summary: str
+    recommended_temperature: float = Field(ge=60.0, le=90.0)
+    rationale: str
+
+
+class FeedbackSuggestion(BaseModel):
+    category: str = Field(pattern="^(energy|security|occupancy|comfort)$")
+    priority: str = Field(pattern="^(LOW|MEDIUM|HIGH)$")
+    title: str
+    detail: str
+
+
+class PeriodicFeedback(BaseModel):
+    summary: str
+    suggestions: list[FeedbackSuggestion] = Field(default_factory=list)
+
+
+class AutonomousActionRecommendation(BaseModel):
+    should_act: bool = False
+    source: str = "ollama"
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    domain: str = "light"
+    action: str = "turn_off"
+    entity_id: str = ""
+    reason: str = ""
+    expected_outcome: dict[str, Any] = Field(default_factory=dict)
+    risk_level: str = Field(default="LOW", pattern="^(LOW|MEDIUM|HIGH)$")
+    fallback_reason: str | None = None
+
+
+@router.get("", response_class=HTMLResponse)
+async def demo_page() -> HTMLResponse:
+    """Serve the browser demo control surface."""
+    page = Path(__file__).resolve().parents[1] / "static" / "demo.html"
+    return HTMLResponse(page.read_text(encoding="utf-8"))
+
+
+@router.post("/demo1")
+async def run_demo1(req: DemoRequest) -> StreamingResponse:
+    """Run the live Demo1 sequence and stream human-readable progress."""
+    if req.code.strip() != DEMO_ACCESS_CODE:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid demo code",
+        )
+
+    return StreamingResponse(
+        _demo1_events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/demo2")
+async def run_demo2(req: DemoRequest) -> StreamingResponse:
+    """Run the thermostat-focused Demo2 sequence."""
+    if req.code.strip() != DEMO2_ACCESS_CODE:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid demo code",
+        )
+
+    return StreamingResponse(
+        _demo2_events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/demo3")
+async def run_demo3(req: DemoRequest) -> StreamingResponse:
+    """Run the sprinkler/watering safety demo."""
+    if req.code.strip() != DEMO3_ACCESS_CODE:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid demo code",
+        )
+
+    return StreamingResponse(
+        _demo3_events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/demo4")
+async def run_demo4(req: DemoRequest) -> StreamingResponse:
+    """Run the garage safety demo."""
+    if req.code.strip() != DEMO4_ACCESS_CODE:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid demo code",
+        )
+
+    return StreamingResponse(
+        _demo4_events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.get("/feedback")
+async def periodic_feedback() -> dict[str, Any]:
+    """Return passive LLM-backed household feedback without taking actions."""
+    return await collect_periodic_feedback(trigger="api")
+
+
+async def collect_periodic_feedback(trigger: str = "manual") -> dict[str, Any]:
+    """Collect suggestion-only household feedback for UI or background monitoring."""
+    states = await _read_all_ha_states()
+    snapshot = _build_household_feedback_snapshot(states)
+    feedback = await _llm_periodic_feedback(snapshot)
+    await write_audit_event_async(
+        "feedback.generated",
+        {
+            "mode": "suggestions_only",
+            "source": feedback["source"],
+            "summary": feedback["summary"],
+            "suggestions": feedback["suggestions"],
+            "suggestion_count": len(feedback["suggestions"]),
+            "occupancy_status": snapshot["occupancy_status"],
+            "lights_on_count": len(snapshot["lights_on"]),
+            "switches_on_count": len(snapshot["switches_on"]),
+            "active_motion_count": len(snapshot["active_motion"]),
+            "top_power_now_w": snapshot["top_power_now_w"][:3],
+            "warning": feedback["warning"],
+            "trigger": trigger,
+        },
+    )
+    return {
+        "mode": "suggestions_only",
+        "source": feedback["source"],
+        "warning": feedback["warning"],
+        "summary": feedback["summary"],
+        "suggestions": feedback["suggestions"],
+        "snapshot": snapshot,
+    }
+
+
+async def recommend_autonomous_action(
+    feedback: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Ask the LLM for one safe autonomous action from the latest context."""
+    snapshot = feedback.get("snapshot", {})
+    allowed_entities = _allowed_autonomous_entities()
+    allowed_actions = _allowed_autonomous_actions()
+    safe_turn_off_targets = _prevalidated_turn_off_targets(snapshot)
+    prompt = (
+        "You are EcoNest's autonomous smart-home policy model. Decide whether "
+        "EcoNest should execute exactly one low-risk action now.\n\n"
+        "Safety rules:\n"
+        "- Only recommend an action if confidence is high.\n"
+        "- Only use allowed actions and entities.\n"
+        "- Do not recommend climate, lock, garage, cover, alarm, or security actions.\n"
+        "- The Pre-validated safe turn-off targets list was produced by "
+        "EcoNest's deterministic allowlist, state, and motion checks. It is "
+        "not ambiguous. If that list is non-empty, you MUST choose its first "
+        "target: return should_act=true, domain=light, action=turn_off, that "
+        "entity_id, risk_level=LOW, and confidence at least 0.85.\n"
+        "- Prefer doing nothing if context is ambiguous.\n\n"
+        f"Allowed actions: {sorted(allowed_actions)}\n"
+        f"Allowed entities: {sorted(allowed_entities)}\n"
+        f"Pre-validated safe turn-off targets: {json.dumps(safe_turn_off_targets)}\n"
+        f"Feedback JSON:\n{json.dumps(feedback, default=str)}\n\n"
+        "Return JSON only."
+    )
+    client = LLMClient()
+    try:
+        recommendation = await client.generate_structured(
+            [LLMMessage(role="user", content=prompt)],
+            AutonomousActionRecommendation,
+            temperature=0.0,
+        )
+    except Exception as exc:
+        recommendation = _fallback_autonomous_action(
+            feedback,
+            fallback_reason=_autonomy_model_failure_reason(exc),
+        )
+    finally:
+        await client.close()
+
+    guarded = _guard_autonomous_action(recommendation, snapshot)
+    if guarded is None or not guarded.should_act:
+        return None
+    return guarded.model_dump()
+
+
+async def execute_autonomous_action(recommendation: dict[str, Any]) -> dict[str, Any]:
+    """Route one autonomous recommendation through the device agent."""
+    entity_id = str(recommendation.get("entity_id", ""))
+    action = str(recommendation.get("action", ""))
+    domain = str(recommendation.get("domain") or entity_id.split(".", 1)[0])
+    task = Task(
+        intent=f"autonomous {action} for {entity_id}",
+        payload={
+            "device_id": entity_id,
+            "entity_id": entity_id,
+            "domain": domain,
+            "action": action,
+            "expected_outcome": recommendation.get("expected_outcome", {}),
+            "trigger": "background_monitor",
+            "user_role": Role.HOMEOWNER.value,
+        },
+        timeout_seconds=30,
+        metadata={
+            "source": "background_monitor",
+            "user_role": Role.HOMEOWNER.value,
+            "expected_outcome": recommendation.get("expected_outcome", {}),
+            "llm_confidence": recommendation.get("confidence"),
+            "llm_reason": recommendation.get("reason"),
+        },
+    )
+    task_id = await _demo_orchestrator.submit(task)
+    result = await _wait_for_task(task_id)
+    if result is None:
+        return {
+            "success": False,
+            "task_id": task_id,
+            "error": "timeout",
+            "message": "Autonomous action timed out",
+        }
+    payload = result.model_dump()
+    payload["success"] = result.success
+    return payload
+
+
+@router.get("/audit")
+async def recent_audit(limit: int = 50) -> dict[str, Any]:
+    """Return recent autonomous runtime events from the durable audit log."""
+    bounded_limit = max(1, min(limit, 200))
+    return {
+        "events": read_recent_audit_events(bounded_limit),
+        "limit": bounded_limit,
+    }
+
+
+@router.get("/audit/summary")
+async def audit_summary(limit: int = 500) -> dict[str, Any]:
+    """Return aggregate health metrics from recent audit events."""
+    bounded_limit = max(1, min(limit, 5000))
+    events = read_recent_audit_events(bounded_limit)
+    return {
+        "limit": bounded_limit,
+        "summary": summarize_audit_events(events),
+    }
+
+
+async def _demo1_events() -> AsyncIterator[str]:
+    yield _event(
+        "start",
+        "Demo1 started",
+        "Replaying smart-home events and letting EcoNest route them to agents.",
+    )
+
+    mysql_ok = await healthcheck_mysql()
+    arcade_ok = await healthcheck_arcadedb()
+    yield _event(
+        "health",
+        "Infrastructure check",
+        "MySQL and ArcadeDB are reachable."
+        if mysql_ok and arcade_ok
+        else "One or more infrastructure services are degraded.",
+        {"mysql": mysql_ok, "arcadedb": arcade_ok},
+        ok=mysql_ok and arcade_ok,
+    )
+
+    initial_state = await _read_ha_state(DEMO_MEDIA_LIGHT_ENTITY)
+    yield _event(
+        "home_assistant",
+        "Media room light before event",
+        _state_summary(initial_state),
+        {"entity_id": DEMO_MEDIA_LIGHT_ENTITY, "state": initial_state},
+        ok=bool(initial_state.get("success")),
+    )
+
+    energy_task = Task(
+        intent="energy anomaly detected in media room",
+        payload={
+            "type": "energy",
+            "room": "media room",
+            "device_name": "Media Room Plug",
+            "current_power_w": 650,
+            "baseline_w": 100,
+            "trigger": "Demo1",
+            "user_role": Role.HOMEOWNER.value,
+        },
+        timeout_seconds=30,
+        metadata={
+            "source": "demo_event_replay",
+            "event_type": "energy_anomaly",
+            "user_role": Role.HOMEOWNER.value,
+        },
+    )
+    energy_task_id = await _demo_orchestrator.submit(energy_task)
+    yield _event(
+        "agent",
+        "Energy anomaly submitted",
+        "EcoNest is routing an unusual power spike to the energy agent.",
+        {"task_id": energy_task_id, "intent": energy_task.intent},
+    )
+
+    energy_result = await _wait_for_task(energy_task_id)
+    if energy_result is None:
+        yield _event(
+            "failed",
+            "Energy agent task timed out",
+            "The energy agent did not finish within the demo window.",
+            {"task_id": energy_task_id},
+            ok=False,
+        )
+        return
+
+    yield _event(
+        "agent_result",
+        "Energy agent result",
+        _agent_summary(energy_result),
+        energy_result.model_dump(),
+        ok=energy_result.success,
+    )
+
+    device_task = Task(
+        intent="motion detected in media room, turn on media room light",
+        payload={
+            "event_type": "motion_detected",
+            "room": "media room",
+            "device_id": DEMO_MEDIA_LIGHT_ENTITY,
+            "entity_id": DEMO_MEDIA_LIGHT_ENTITY,
+            "domain": "light",
+            "action": "turn_on",
+            "expected_outcome": {
+                "entity_id": DEMO_MEDIA_LIGHT_ENTITY,
+                "state": "on",
+            },
+            "trigger": "Demo1",
+            "user_role": Role.HOMEOWNER.value,
+        },
+        timeout_seconds=30,
+        metadata={
+            "source": "ha_event_replay",
+            "event_type": "motion_detected",
+            "user_role": Role.HOMEOWNER.value,
+        },
+    )
+    device_task_id = await _demo_orchestrator.submit(device_task)
+    yield _event(
+        "agent",
+        "Motion event submitted",
+        "EcoNest is routing the motion event to the device agent for action.",
+        {"task_id": device_task_id, "intent": device_task.intent},
+    )
+
+    device_result = await _wait_for_task(device_task_id)
+    if device_result is None:
+        yield _event(
+            "failed",
+            "Device agent task timed out",
+            "The device agent did not finish within the demo window.",
+            {"task_id": device_task_id},
+            ok=False,
+        )
+        return
+
+    yield _event(
+        "agent_result",
+        "Device agent result",
+        _agent_summary(device_result),
+        device_result.model_dump(),
+        ok=device_result.success,
+    )
+
+    final_state = await _read_ha_state(DEMO_MEDIA_LIGHT_ENTITY)
+    yield _event(
+        "home_assistant",
+        "Media room light after event",
+        _state_summary(final_state),
+        {"entity_id": DEMO_MEDIA_LIGHT_ENTITY, "state": final_state},
+        ok=bool(final_state.get("success")),
+    )
+
+    yield _event(
+        "occupancy",
+        "Vacancy timeout detected",
+        "Simulated follow-up event: 10 minutes pass with no media room motion.",
+        {
+            "room": "media room",
+            "occupancy_signal": "no_motion_for_10_minutes",
+            "policy": "vacant rooms should not keep nonessential lights on",
+        },
+    )
+
+    reasoning = await _llm_light_policy_reasoning(final_state)
+    yield _event(
+        "llm_reasoning",
+        "LLM policy reasoning",
+        reasoning["summary"],
+        reasoning,
+        ok=reasoning["source"] == "ollama",
+    )
+
+    off_task_id: str | None = None
+    off_result: Result | None = None
+    off_state: dict[str, Any] | None = None
+    if reasoning["recommended_action"] == "turn_off":
+        off_task = Task(
+            intent="room is vacant, turn off media room light",
+            payload={
+                "event_type": "occupancy_cleared",
+                "room": "media room",
+                "device_id": DEMO_MEDIA_LIGHT_ENTITY,
+                "entity_id": DEMO_MEDIA_LIGHT_ENTITY,
+                "domain": "light",
+                "action": "turn_off",
+                "expected_outcome": {
+                    "entity_id": DEMO_MEDIA_LIGHT_ENTITY,
+                    "state": "off",
+                },
+                "trigger": "Demo1",
+                "user_role": Role.HOMEOWNER.value,
+            },
+            timeout_seconds=30,
+            metadata={
+                "source": "llm_policy_recommendation",
+                "event_type": "occupancy_cleared",
+                "user_role": Role.HOMEOWNER.value,
+            },
+        )
+        off_task_id = await _demo_orchestrator.submit(off_task)
+        yield _event(
+            "agent",
+            "Policy action submitted",
+            "EcoNest is routing the LLM recommendation to the device agent.",
+            {"task_id": off_task_id, "intent": off_task.intent},
+        )
+
+        off_result = await _wait_for_task(off_task_id)
+        if off_result is None:
+            yield _event(
+                "failed",
+                "Policy action timed out",
+                "The device agent did not finish the turn-off action within the demo window.",
+                {"task_id": off_task_id},
+                ok=False,
+            )
+            return
+
+        yield _event(
+            "agent_result",
+            "Policy action result",
+            _agent_summary(off_result),
+            off_result.model_dump(),
+            ok=off_result.success,
+        )
+
+        off_state = await _read_ha_state(DEMO_MEDIA_LIGHT_ENTITY)
+        yield _event(
+            "home_assistant",
+            "Media room light after policy action",
+            _state_summary(off_state),
+            {"entity_id": DEMO_MEDIA_LIGHT_ENTITY, "state": off_state},
+            ok=bool(off_state.get("success")),
+        )
+
+    yield _event(
+        "complete",
+        "Demo1 complete",
+        "The events were routed through EcoNest, LLM reasoning was shown, and Home Assistant state was checked.",
+        {
+            "energy_task_id": energy_task_id,
+            "device_task_id": device_task_id,
+            "policy_task_id": off_task_id,
+            "agents": [
+                agent
+                for agent in (
+                    energy_result.agent,
+                    device_result.agent,
+                    off_result.agent if off_result else None,
+                )
+                if agent is not None
+            ],
+            "llm_source": reasoning["source"],
+            "recommended_action": reasoning["recommended_action"],
+            "verified": (
+                off_result.metadata.get("verified")
+                if off_result
+                else device_result.metadata.get("verified")
+            ),
+            "confidence": off_result.confidence if off_result else device_result.confidence,
+            "final_state": _ha_state_value(off_state or final_state),
+        },
+        ok=energy_result.success
+        and device_result.success
+        and (off_result.success if off_result else True),
+    )
+
+
+async def _demo2_events() -> AsyncIterator[str]:
+    yield _event(
+        "start",
+        "Demo2 started",
+        "Reading the media room thermostat and asking Ollama to reason about comfort and energy.",
+    )
+
+    mysql_ok = await healthcheck_mysql()
+    arcade_ok = await healthcheck_arcadedb()
+    yield _event(
+        "health",
+        "Infrastructure check",
+        "MySQL and ArcadeDB are reachable."
+        if mysql_ok and arcade_ok
+        else "One or more infrastructure services are degraded.",
+        {"mysql": mysql_ok, "arcadedb": arcade_ok},
+        ok=mysql_ok and arcade_ok,
+    )
+
+    thermostat_state = await _read_ha_state(DEMO_MEDIA_THERMOSTAT_ENTITY)
+    temperature_state = await _read_ha_state(DEMO_MEDIA_TEMPERATURE_SENSOR)
+    humidity_state = await _read_ha_state(DEMO_MEDIA_HUMIDITY_SENSOR)
+    yield _event(
+        "home_assistant",
+        "Media room climate snapshot",
+        _climate_snapshot_summary(
+            thermostat_state,
+            temperature_state,
+            humidity_state,
+        ),
+        {
+            "thermostat": thermostat_state,
+            "temperature_sensor": temperature_state,
+            "humidity_sensor": humidity_state,
+        },
+        ok=bool(thermostat_state.get("success")),
+    )
+
+    reasoning = await _llm_thermostat_reasoning(
+        thermostat_state,
+        temperature_state,
+        humidity_state,
+    )
+    yield _event(
+        "llm_reasoning",
+        "Thermostat LLM reasoning",
+        reasoning["summary"],
+        reasoning,
+        ok=reasoning["source"] in {"ollama", "policy_guarded_ollama"},
+    )
+
+    setpoint = reasoning["bounded_temperature"]
+    climate_task = Task(
+        intent="adjust media room thermostat based on comfort and energy reasoning",
+        payload={
+            "event_type": "comfort_energy_review",
+            "room": "media room",
+            "device_id": DEMO_MEDIA_THERMOSTAT_ENTITY,
+            "entity_id": DEMO_MEDIA_THERMOSTAT_ENTITY,
+            "domain": "climate",
+            "action": "set_temperature",
+            "temperature": setpoint,
+            "expected_outcome": {
+                "entity_id": DEMO_MEDIA_THERMOSTAT_ENTITY,
+                "attribute": "temperature",
+                "value": setpoint,
+            },
+            "trigger": "Demo2",
+            "user_role": Role.HOMEOWNER.value,
+        },
+        timeout_seconds=30,
+        metadata={
+            "source": "llm_climate_recommendation",
+            "event_type": "comfort_energy_review",
+            "user_role": Role.HOMEOWNER.value,
+        },
+    )
+    climate_task_id = await _demo_orchestrator.submit(climate_task)
+    yield _event(
+        "agent",
+        "Thermostat action submitted",
+        "EcoNest is routing the bounded LLM recommendation to the device agent.",
+        {"task_id": climate_task_id, "intent": climate_task.intent},
+    )
+
+    climate_result = await _wait_for_task(climate_task_id)
+    if climate_result is None:
+        yield _event(
+            "failed",
+            "Thermostat action timed out",
+            "The device agent did not finish the thermostat action within the demo window.",
+            {"task_id": climate_task_id},
+            ok=False,
+        )
+        return
+
+    yield _event(
+        "agent_result",
+        "Thermostat action result",
+        _agent_summary(climate_result),
+        climate_result.model_dump(),
+        ok=climate_result.success,
+    )
+
+    updated_thermostat_state = await _read_ha_state(DEMO_MEDIA_THERMOSTAT_ENTITY)
+    yield _event(
+        "home_assistant",
+        "Media room thermostat after action",
+        _thermostat_target_summary(updated_thermostat_state),
+        {
+            "entity_id": DEMO_MEDIA_THERMOSTAT_ENTITY,
+            "state": updated_thermostat_state,
+        },
+        ok=bool(updated_thermostat_state.get("success")),
+    )
+
+    yield _event(
+        "complete",
+        "Demo2 complete",
+        "Ollama reasoned over the climate context, EcoNest bounded the recommendation, and the device agent applied it through Home Assistant.",
+        {
+            "task_id": climate_task_id,
+            "agents": ["llm", climate_result.agent],
+            "llm_source": reasoning["source"],
+            "recommended_temperature": reasoning["recommended_temperature"],
+            "bounded_temperature": setpoint,
+            "verified": climate_result.metadata.get("verified"),
+            "confidence": climate_result.confidence,
+            "final_target_temperature": _ha_attribute_value(
+                updated_thermostat_state,
+                "temperature",
+            ),
+        },
+        ok=climate_result.success,
+    )
+
+
+async def _demo3_events() -> AsyncIterator[str]:
+    yield _event(
+        "start",
+        "Demo3 started",
+        "Inspecting a live sprinkler/watering switch and routing a safe shutoff action.",
+    )
+
+    mysql_ok = await healthcheck_mysql()
+    arcade_ok = await healthcheck_arcadedb()
+    yield _event(
+        "health",
+        "Infrastructure check",
+        "MySQL and ArcadeDB are reachable."
+        if mysql_ok and arcade_ok
+        else "One or more infrastructure services are degraded.",
+        {"mysql": mysql_ok, "arcadedb": arcade_ok},
+        ok=mysql_ok and arcade_ok,
+    )
+
+    initial_state = await _read_ha_state(DEMO_SPRINKLER_ENTITY)
+    yield _event(
+        "home_assistant",
+        "Sprinkler switch before policy",
+        _state_summary(initial_state),
+        {"entity_id": DEMO_SPRINKLER_ENTITY, "state": initial_state},
+        ok=bool(initial_state.get("success")),
+    )
+
+    reasoning = await _llm_sprinkler_reasoning(initial_state)
+    yield _event(
+        "llm_reasoning",
+        "Sprinkler LLM reasoning",
+        reasoning["summary"],
+        reasoning,
+        ok=reasoning["source"] in {"ollama", "fallback"},
+    )
+
+    task = Task(
+        intent="sprinkler watering should be shut off for conservation demo",
+        payload={
+            "event_type": "sprinkler_conservation_review",
+            "device_id": DEMO_SPRINKLER_ENTITY,
+            "entity_id": DEMO_SPRINKLER_ENTITY,
+            "domain": "switch",
+            "action": "turn_off",
+            "expected_outcome": {
+                "entity_id": DEMO_SPRINKLER_ENTITY,
+                "state": "off",
+            },
+            "trigger": "Demo3",
+            "user_role": Role.HOMEOWNER.value,
+        },
+        timeout_seconds=30,
+        metadata={
+            "source": "llm_sprinkler_recommendation",
+            "event_type": "sprinkler_conservation_review",
+            "user_role": Role.HOMEOWNER.value,
+            "llm_confidence": reasoning["confidence"],
+            "llm_reason": reasoning["summary"],
+        },
+    )
+    task_id = await _demo_orchestrator.submit(task)
+    yield _event(
+        "agent",
+        "Sprinkler action submitted",
+        "EcoNest is routing the conservation recommendation to the device agent.",
+        {"task_id": task_id, "intent": task.intent},
+    )
+
+    result = await _wait_for_task(task_id)
+    if result is None:
+        yield _event(
+            "failed",
+            "Sprinkler action timed out",
+            "The device agent did not finish the sprinkler action within the demo window.",
+            {"task_id": task_id},
+            ok=False,
+        )
+        return
+
+    yield _event(
+        "agent_result",
+        "Sprinkler action result",
+        _agent_summary(result),
+        result.model_dump(),
+        ok=result.success,
+    )
+
+    final_state = await _read_ha_state(DEMO_SPRINKLER_ENTITY)
+    yield _event(
+        "home_assistant",
+        "Sprinkler switch after action",
+        _state_summary(final_state),
+        {"entity_id": DEMO_SPRINKLER_ENTITY, "state": final_state},
+        ok=bool(final_state.get("success")),
+    )
+
+    yield _event(
+        "complete",
+        "Demo3 complete",
+        "EcoNest reasoned over sprinkler conservation context, acted through Home Assistant, and verified the switch state.",
+        {
+            "task_id": task_id,
+            "agents": ["llm", result.agent],
+            "recommended_action": "turn_off",
+            "verified": result.metadata.get("verified"),
+            "confidence": result.confidence,
+            "final_state": _ha_state_value(final_state),
+        },
+        ok=result.success,
+    )
+
+
+async def _demo4_events() -> AsyncIterator[str]:
+    yield _event(
+        "start",
+        "Demo4 started",
+        "Inspecting a live garage door and routing only a safe close command.",
+    )
+
+    mysql_ok = await healthcheck_mysql()
+    arcade_ok = await healthcheck_arcadedb()
+    yield _event(
+        "health",
+        "Infrastructure check",
+        "MySQL and ArcadeDB are reachable."
+        if mysql_ok and arcade_ok
+        else "One or more infrastructure services are degraded.",
+        {"mysql": mysql_ok, "arcadedb": arcade_ok},
+        ok=mysql_ok and arcade_ok,
+    )
+
+    initial_state = await _read_ha_state(DEMO_GARAGE_ENTITY)
+    yield _event(
+        "home_assistant",
+        "Garage door before policy",
+        _state_summary(initial_state),
+        {"entity_id": DEMO_GARAGE_ENTITY, "state": initial_state},
+        ok=bool(initial_state.get("success")),
+    )
+
+    reasoning = await _llm_garage_reasoning(initial_state)
+    yield _event(
+        "llm_reasoning",
+        "Garage LLM reasoning",
+        reasoning["summary"],
+        reasoning,
+        ok=reasoning["source"] in {"ollama", "fallback"},
+    )
+
+    task = Task(
+        intent="garage should be secured closed for safety demo",
+        payload={
+            "event_type": "garage_security_review",
+            "device_id": DEMO_GARAGE_ENTITY,
+            "entity_id": DEMO_GARAGE_ENTITY,
+            "domain": "cover",
+            "action": "close",
+            "expected_outcome": {
+                "entity_id": DEMO_GARAGE_ENTITY,
+                "state": "closed",
+            },
+            "trigger": "Demo4",
+            "user_role": Role.HOMEOWNER.value,
+        },
+        timeout_seconds=30,
+        metadata={
+            "source": "llm_garage_recommendation",
+            "event_type": "garage_security_review",
+            "user_role": Role.HOMEOWNER.value,
+            "llm_confidence": reasoning["confidence"],
+            "llm_reason": reasoning["summary"],
+        },
+    )
+    task_id = await _demo_orchestrator.submit(task)
+    yield _event(
+        "agent",
+        "Garage close action submitted",
+        "EcoNest is routing a close-only garage safety recommendation to the device agent.",
+        {"task_id": task_id, "intent": task.intent},
+    )
+
+    result = await _wait_for_task(task_id)
+    if result is None:
+        yield _event(
+            "failed",
+            "Garage action timed out",
+            "The device agent did not finish the garage action within the demo window.",
+            {"task_id": task_id},
+            ok=False,
+        )
+        return
+
+    yield _event(
+        "agent_result",
+        "Garage action result",
+        _agent_summary(result),
+        result.model_dump(),
+        ok=result.success,
+    )
+
+    final_state = await _read_ha_state(DEMO_GARAGE_ENTITY)
+    yield _event(
+        "home_assistant",
+        "Garage door after action",
+        _state_summary(final_state),
+        {"entity_id": DEMO_GARAGE_ENTITY, "state": final_state},
+        ok=bool(final_state.get("success")),
+    )
+
+    yield _event(
+        "complete",
+        "Demo4 complete",
+        "EcoNest reasoned over garage safety context, issued only a close command, and verified the garage state.",
+        {
+            "task_id": task_id,
+            "agents": ["llm", result.agent],
+            "recommended_action": "close",
+            "verified": result.metadata.get("verified"),
+            "confidence": result.confidence,
+            "final_state": _ha_state_value(final_state),
+        },
+        ok=result.success,
+    )
+
+
+async def _read_ha_state(entity_id: str) -> dict[str, Any]:
+    result = await ha_get_state_handler(HAGetStateInput(entity_id=entity_id))
+    if hasattr(result, "model_dump"):
+        return result.model_dump()
+    return dict(result)
+
+
+async def _read_all_ha_states() -> list[dict[str, Any]]:
+    token = settings.HA_TOKEN or os.getenv("HA_TOKEN", "")
+    if not token:
+        return []
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        response = await client.get(
+            f"{settings.HA_URL}/api/states",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        response.raise_for_status()
+    data = response.json()
+    return data if isinstance(data, list) else []
+
+
+async def _wait_for_task(task_id: str) -> Result | None:
+    for _ in range(DEMO_MAX_POLLS):
+        result = await _demo_orchestrator.get_result(task_id)
+        if result is not None:
+            return result
+        await asyncio.sleep(DEMO_POLL_INTERVAL_SECONDS)
+    return None
+
+
+def _build_household_feedback_snapshot(states: list[dict[str, Any]]) -> dict[str, Any]:
+    people = [
+        _entity_summary(item)
+        for item in states
+        if str(item.get("entity_id", "")).startswith(("person.", "device_tracker."))
+    ]
+    occupancy_status = _occupancy_status(people)
+    transition = _record_occupancy_observation(occupancy_status)
+
+    lights_on = [
+        _entity_summary(item)
+        for item in states
+        if str(item.get("entity_id", "")).startswith("light.")
+        and str(item.get("state", "")).lower() == "on"
+    ]
+    switches_on = [
+        _entity_summary(item)
+        for item in states
+        if str(item.get("entity_id", "")).startswith("switch.")
+        and str(item.get("state", "")).lower() == "on"
+    ]
+    covers_open = [
+        _entity_summary(item)
+        for item in states
+        if str(item.get("entity_id", "")).startswith("cover.")
+        and str(item.get("state", "")).lower() not in {"closed", "closing"}
+    ]
+    active_motion = [
+        _entity_summary(item)
+        for item in states
+        if str(item.get("entity_id", "")).startswith("binary_sensor.")
+        and "motion" in _entity_text(item)
+        and str(item.get("state", "")).lower() == "on"
+    ]
+    power_now = sorted(
+        [
+            _numeric_sensor_summary(item)
+            for item in states
+            if "power_minute_average" in str(item.get("entity_id", ""))
+        ],
+        key=lambda item: item["value"],
+        reverse=True,
+    )[:8]
+    energy_today = sorted(
+        [
+            _numeric_sensor_summary(item)
+            for item in states
+            if "energy_today" in str(item.get("entity_id", ""))
+        ],
+        key=lambda item: item["value"],
+        reverse=True,
+    )[:8]
+
+    return {
+        "occupancy_status": occupancy_status,
+        "occupancy_transition": transition,
+        "observation_count": _feedback_memory["observation_count"],
+        "recent_occupancy_transitions": list(_feedback_memory["transitions"][-5:]),
+        "people": people[:10],
+        "lights_on": lights_on[:15],
+        "switches_on": switches_on[:15],
+        "covers_open": covers_open,
+        "active_motion": active_motion,
+        "top_power_now_w": power_now,
+        "top_energy_today_kwh": energy_today,
+    }
+
+
+async def _llm_periodic_feedback(snapshot: dict[str, Any]) -> dict[str, Any]:
+    prompt = (
+        "You are EcoNest's passive home advisor. Review this Home Assistant snapshot "
+        "and produce suggestion-only feedback. Do not tell the system to take actions. "
+        "Focus on energy waste, security awareness, occupancy patterns, and comfort.\n\n"
+        f"Snapshot JSON:\n{json.dumps(snapshot, default=str)}\n\n"
+        "Return concise suggestions a resident could choose to do manually. "
+        "Mention occupancy transitions if useful. Prefer JSON with summary and suggestions, "
+        "but plain text bullets are acceptable. Only use entities and facts present "
+        "in the snapshot. Do not invent examples, pets, passwords, biometric security, "
+        "or generic cybersecurity advice."
+    )
+    client = LLMClient()
+    try:
+        raw = await client.generate(
+            prompt,
+            system="You produce passive smart-home suggestions. Never issue commands.",
+            temperature=0.2,
+        )
+        result = _periodic_feedback_from_text(raw, snapshot)
+        source = "ollama"
+        warning = None
+    except Exception as exc:
+        result = _fallback_periodic_feedback(snapshot)
+        source = "fallback"
+        warning = str(exc)
+    finally:
+        await client.close()
+
+    observed = _fallback_periodic_feedback(snapshot).suggestions
+    combined = _merge_feedback_suggestions(observed, result.suggestions)
+    suggestions = [item.model_dump() for item in combined[:6]]
+    return {
+        "source": source,
+        "warning": warning,
+        "summary": result.summary,
+        "suggestions": suggestions,
+    }
+
+
+def _periodic_feedback_from_text(text: str, snapshot: dict[str, Any]) -> PeriodicFeedback:
+    cleaned = _clean_jsonish_text(text)
+    try:
+        return PeriodicFeedback.model_validate_json(cleaned)
+    except Exception:
+        pass
+
+    lines = [
+        line.strip(" -*0123456789.").strip()
+        for line in text.splitlines()
+        if line.strip()
+    ]
+    suggestion_lines = [
+        line
+        for line in lines
+        if len(line) > 20
+        and not line.lower().startswith(("summary", "here"))
+        and _is_grounded_feedback_line(line)
+    ][:6]
+    suggestions = [
+        FeedbackSuggestion(
+            category=_infer_feedback_category(line),
+            priority=_infer_feedback_priority(line),
+            title=_clean_feedback_line(line)[:70],
+            detail=_clean_feedback_line(line),
+        )
+        for line in suggestion_lines
+    ]
+    if not suggestions:
+        return _fallback_periodic_feedback(snapshot)
+    return PeriodicFeedback(
+        summary=(
+            f"House appears {snapshot['occupancy_status']}; Ollama generated "
+            "suggestion-only feedback from the latest Home Assistant snapshot."
+        ),
+        suggestions=suggestions,
+    )
+
+
+def _clean_jsonish_text(text: str) -> str:
+    cleaned = text.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    if cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    return cleaned.strip()
+
+
+def _infer_feedback_category(text: str) -> str:
+    lowered = text.lower()
+    if any(word in lowered for word in ("door", "garage", "lock", "security", "motion")):
+        return "security"
+    if any(word in lowered for word in ("home", "away", "resident", "occupancy")):
+        return "occupancy"
+    if any(word in lowered for word in ("temperature", "humidity", "comfort")):
+        return "comfort"
+    return "energy"
+
+
+def _is_grounded_feedback_line(text: str) -> bool:
+    lowered = text.lower()
+    banned = (
+        "[example]",
+        "password",
+        "biometric",
+        "pet",
+        "animal",
+        "sensitive information",
+        "enable authentication",
+    )
+    return not any(term in lowered for term in banned)
+
+
+def _clean_feedback_line(text: str) -> str:
+    return (
+        text.replace("**", "")
+        .replace("[Example]:", "")
+        .replace("Example:", "")
+        .strip(" :-")
+    )
+
+
+def _infer_feedback_priority(text: str) -> str:
+    lowered = text.lower()
+    if any(word in lowered for word in ("urgent", "high", "open", "away")):
+        return "HIGH"
+    if any(word in lowered for word in ("review", "consider", "reduce", "highest")):
+        return "MEDIUM"
+    return "LOW"
+
+
+def _fallback_periodic_feedback(snapshot: dict[str, Any]) -> PeriodicFeedback:
+    suggestions: list[FeedbackSuggestion] = []
+    if snapshot["occupancy_status"] == "away" and snapshot["lights_on"]:
+        suggestions.append(
+            FeedbackSuggestion(
+                category="energy",
+                priority="HIGH",
+                title="Lights are on while the house appears away",
+                detail=(
+                    "Consider checking the listed lights when convenient, especially "
+                    "if nobody is home."
+                ),
+            )
+        )
+    for top in snapshot["top_power_now_w"][:3]:
+        suggestions.append(
+            FeedbackSuggestion(
+                category="energy",
+                priority="MEDIUM",
+                title=f"Review current load: {top['name']}",
+                detail=(
+                    f"{top['name']} is reading about {top['value']:.1f} W. "
+                    "If this is unexpected, it may be worth reviewing."
+                ),
+            )
+        )
+    for light in snapshot["lights_on"][:3]:
+        suggestions.append(
+            FeedbackSuggestion(
+                category="energy",
+                priority="LOW",
+                title=f"Light currently on: {light['name']}",
+                detail=(
+                    f"{light['name']} is on while the house appears "
+                    f"{snapshot['occupancy_status']}. Consider turning it off if the "
+                    "room is not being used."
+                ),
+            )
+        )
+    if snapshot["covers_open"]:
+        suggestions.append(
+            FeedbackSuggestion(
+                category="security",
+                priority="HIGH",
+                title="A garage or cover is not closed",
+                detail="Check open covers before leaving or going to sleep.",
+            )
+        )
+    if snapshot["occupancy_transition"]:
+        suggestions.append(
+            FeedbackSuggestion(
+                category="occupancy",
+                priority="LOW",
+                title="Occupancy pattern changed",
+                detail=(
+                    f"EcoNest observed a transition from "
+                    f"{snapshot['occupancy_transition']['from']} to "
+                    f"{snapshot['occupancy_transition']['to']}."
+                ),
+            )
+        )
+    if not suggestions:
+        suggestions.append(
+            FeedbackSuggestion(
+                category="energy",
+                priority="LOW",
+                title="No urgent issues detected",
+                detail="Current energy and security signals look normal.",
+            )
+        )
+    return PeriodicFeedback(
+        summary=(
+            f"House appears {snapshot['occupancy_status']}; generated "
+            "suggestion-only feedback from the latest Home Assistant snapshot."
+        ),
+        suggestions=suggestions,
+    )
+
+
+def _merge_feedback_suggestions(
+    observed: list[FeedbackSuggestion],
+    llm: list[FeedbackSuggestion],
+) -> list[FeedbackSuggestion]:
+    merged: list[FeedbackSuggestion] = []
+    seen: set[str] = set()
+    for suggestion in [*observed, *llm]:
+        key = suggestion.title.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(suggestion)
+    return merged
+
+
+def _fallback_autonomous_action(
+    feedback: dict[str, Any],
+    fallback_reason: str | None = None,
+) -> AutonomousActionRecommendation:
+    snapshot = feedback.get("snapshot", {})
+    allowed_entities = _allowed_autonomous_entities()
+    for light in snapshot.get("lights_on", []):
+        entity_id = str(light.get("entity_id", ""))
+        if entity_id in allowed_entities and not snapshot.get("active_motion"):
+            return AutonomousActionRecommendation(
+                should_act=True,
+                source="fallback_policy",
+                confidence=0.9,
+                domain="light",
+                action="turn_off",
+                entity_id=entity_id,
+                reason=(
+                    f"{light.get('name', entity_id)} is on and no active motion "
+                    "is present in the current snapshot."
+                ),
+                expected_outcome={"entity_id": entity_id, "state": "off"},
+                risk_level="LOW",
+                fallback_reason=fallback_reason,
+            )
+    return AutonomousActionRecommendation(
+        should_act=False,
+        source="fallback_policy",
+        confidence=0.0,
+        reason="No allowlisted low-risk action is currently justified.",
+        fallback_reason=fallback_reason,
+    )
+
+
+def _prevalidated_turn_off_targets(snapshot: dict[str, Any]) -> list[dict[str, str]]:
+    """Return safe lighting evidence for the model without choosing an action."""
+    if snapshot.get("active_motion", []):
+        return []
+
+    if "light.turn_off" not in _allowed_autonomous_actions():
+        return []
+
+    allowed_entities = _allowed_autonomous_entities()
+    for light in snapshot.get("lights_on", []):
+        entity_id = str(light.get("entity_id", ""))
+        if entity_id not in allowed_entities:
+            continue
+        return [{"entity_id": entity_id, "name": str(light.get("name", entity_id))}]
+    return []
+
+
+def _autonomy_model_failure_reason(exc: Exception) -> str:
+    """Return a safe, useful explanation for an action-model fallback."""
+    if isinstance(exc, httpx.TimeoutException):
+        return "Ollama did not respond within EcoNest's 60-second model timeout."
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"Ollama returned HTTP {exc.response.status_code}."
+    if isinstance(exc, httpx.RequestError):
+        return "EcoNest could not connect to Ollama for the structured action decision."
+    if exc.__class__.__name__ == "ValidationError":
+        return "Ollama returned an action response that did not match EcoNest's required format."
+    return f"Ollama action decision failed: {exc.__class__.__name__}."
+
+
+def _guard_autonomous_action(
+    recommendation: AutonomousActionRecommendation,
+    snapshot: dict[str, Any],
+) -> AutonomousActionRecommendation | None:
+    if not recommendation.should_act:
+        return recommendation
+
+    action_key = f"{recommendation.domain}.{recommendation.action}"
+
+    if action_key not in _allowed_autonomous_actions():
+        return None
+
+    if recommendation.entity_id not in _allowed_autonomous_entities():
+        return None
+
+    if recommendation.risk_level != "LOW":
+        return None
+
+    if recommendation.domain != "light" or recommendation.action not in {
+        "turn_on",
+        "turn_off",
+    }:
+        return None
+
+    lights_on = {
+        str(light.get("entity_id", ""))
+        for light in snapshot.get("lights_on", [])
+        if isinstance(light, dict)
+    }
+
+    # turn_off is valid only when the allowlisted light is currently ON.
+    if recommendation.action == "turn_off":
+        if recommendation.entity_id not in lights_on:
+            return None
+
+    # turn_on is valid only when the allowlisted light is currently OFF.
+    elif recommendation.action == "turn_on":
+        if recommendation.entity_id in lights_on:
+            return None
+
+    return recommendation.model_copy(
+        update={
+            "expected_outcome": {
+                "entity_id": recommendation.entity_id,
+                "state": "on" if recommendation.action == "turn_on" else "off",
+            }
+        }
+    )
+
+
+def _allowed_autonomous_entities() -> set[str]:
+    return _csv_set(settings.AUTONOMY_ALLOWED_ENTITIES)
+
+
+def _allowed_autonomous_actions() -> set[str]:
+    return _csv_set(settings.AUTONOMY_ALLOWED_ACTIONS)
+
+
+def _csv_set(value: str) -> set[str]:
+    return {item.strip() for item in value.split(",") if item.strip()}
+
+
+async def _llm_thermostat_reasoning(
+    thermostat_state: dict[str, Any],
+    temperature_state: dict[str, Any],
+    humidity_state: dict[str, Any],
+) -> dict[str, Any]:
+    current_temperature = _float_or_none(_ha_state_value(temperature_state))
+    current_humidity = _float_or_none(_ha_state_value(humidity_state))
+    current_target = _float_or_none(_ha_attribute_value(thermostat_state, "temperature"))
+    hvac_mode = _ha_state_value(thermostat_state)
+
+    prompt = (
+        "You are EcoNest's local smart-home climate reasoning model. "
+        "Recommend one thermostat setpoint for a live demo.\n\n"
+        "Context:\n"
+        "- Room: media room\n"
+        f"- Thermostat entity: {DEMO_MEDIA_THERMOSTAT_ENTITY}\n"
+        f"- HVAC mode: {hvac_mode}\n"
+        f"- Current room temperature: {current_temperature} F\n"
+        f"- Current thermostat target: {current_target} F\n"
+        f"- Current humidity: {current_humidity}%\n"
+        "- Scenario: the room is occupied for a study/demo session, but EcoNest should avoid aggressive cooling.\n"
+        f"- Demo safety range: {DEMO_THERMOSTAT_MIN_SETPOINT}-{DEMO_THERMOSTAT_MAX_SETPOINT} F.\n\n"
+        "Return JSON only. Recommend a comfortable but energy-aware target temperature "
+        "inside the demo safety range."
+    )
+    client = LLMClient()
+    try:
+        result = await client.generate_structured(
+            [
+                LLMMessage(
+                    role="user",
+                    content=prompt,
+                )
+            ],
+            ThermostatReasoning,
+            temperature=0.2,
+        )
+        source = "ollama"
+        warning = None
+    except Exception as exc:
+        result = ThermostatReasoning(
+            summary=(
+                "The media room is warm, so EcoNest should choose a moderate "
+                "cooling target instead of an aggressive setpoint."
+            ),
+            recommended_temperature=78.0,
+            rationale="Fallback policy selected a conservative comfort setpoint.",
+        )
+        source = "fallback"
+        warning = str(exc)
+    finally:
+        await client.close()
+
+    bounded = _bounded_temperature(result.recommended_temperature)
+    summary = result.summary.strip() or result.rationale.strip()
+    if bounded != result.recommended_temperature:
+        source = "policy_guarded_ollama" if source == "ollama" else source
+        summary = (
+            f"{summary} EcoNest bounded the setpoint to {bounded:g} F for the demo."
+        )
+
+    return {
+        "agent": "llm",
+        "source": source,
+        "summary": summary,
+        "rationale": result.rationale,
+        "hvac_mode": hvac_mode,
+        "current_temperature": current_temperature,
+        "current_humidity": current_humidity,
+        "current_target_temperature": current_target,
+        "recommended_temperature": result.recommended_temperature,
+        "bounded_temperature": bounded,
+        "warning": warning,
+    }
+
+
+async def _llm_sprinkler_reasoning(
+    sprinkler_state: dict[str, Any],
+) -> dict[str, Any]:
+    state = _ha_state_value(sprinkler_state)
+    prompt = (
+        "You are EcoNest's local smart-home conservation reasoning model. "
+        "Explain why EcoNest should safely turn off this watering switch for a demo.\n\n"
+        f"- Entity: {DEMO_SPRINKLER_ENTITY}\n"
+        f"- Current state: {state}\n"
+        "- Required action: turn_off\n"
+        "- Goal: reduce unnecessary outdoor water use.\n\n"
+        "Use two concise sentences. Do not recommend turning watering on."
+    )
+    client = LLMClient()
+    try:
+        response = await client.generate(
+            prompt,
+            system="You produce concise smart-home conservation reasoning.",
+            temperature=0.2,
+            max_retries=1,
+        )
+        source = "ollama"
+        warning = None
+    except Exception as exc:
+        response = (
+            "The watering switch can be safely turned off for the conservation demo. "
+            "This avoids unnecessary outdoor water use while preserving manual control."
+        )
+        source = "fallback"
+        warning = str(exc)
+    finally:
+        await client.close()
+
+    summary = _clean_demo_reasoning(response.strip())
+    return {
+        "agent": "llm",
+        "source": source,
+        "summary": summary,
+        "observed_state": state,
+        "recommended_action": "turn_off",
+        "confidence": 0.9,
+        "warning": warning,
+    }
+
+
+async def _llm_garage_reasoning(
+    garage_state: dict[str, Any],
+) -> dict[str, Any]:
+    state = _ha_state_value(garage_state)
+    prompt = (
+        "You are EcoNest's local smart-home safety reasoning model. "
+        "Explain why EcoNest should issue only a close command for this garage demo.\n\n"
+        f"- Entity: {DEMO_GARAGE_ENTITY}\n"
+        f"- Current state: {state}\n"
+        "- Required action: close\n"
+        "- Safety rule: never open a garage door autonomously in this demo.\n\n"
+        "Use two concise sentences."
+    )
+    client = LLMClient()
+    try:
+        response = await client.generate(
+            prompt,
+            system="You produce concise smart-home safety reasoning.",
+            temperature=0.2,
+            max_retries=1,
+        )
+        source = "ollama"
+        warning = None
+    except Exception as exc:
+        response = (
+            "The garage should be secured with a close-only command. "
+            "EcoNest will not open the garage autonomously for this demo."
+        )
+        source = "fallback"
+        warning = str(exc)
+    finally:
+        await client.close()
+
+    summary = _guard_garage_reasoning(_clean_demo_reasoning(response.strip()))
+    return {
+        "agent": "llm",
+        "source": source,
+        "summary": summary,
+        "observed_state": state,
+        "recommended_action": "close",
+        "confidence": 0.9,
+        "warning": warning,
+    }
+
+
+def _clean_demo_reasoning(text: str) -> str:
+    return (
+        text.replace("EconoSate", "EcoNest")
+        .replace("EconoState", "EcoNest")
+        .replace("EconoNest", "EcoNest")
+        .strip()
+    )
+
+
+def _guard_garage_reasoning(text: str) -> str:
+    lowered = text.lower()
+    if "open" in lowered and "not open" not in lowered and "never open" not in lowered:
+        return (
+            "EcoNest will issue only a close command for the garage safety demo. "
+            "It will not open the garage autonomously."
+        )
+    return text
+
+
+async def _llm_light_policy_reasoning(
+    light_state: dict[str, Any],
+) -> dict[str, Any]:
+    state = _ha_state_value(light_state)
+    recommended_action = "turn_off" if state == "on" else "none"
+    prompt = (
+        "You are EcoNest's local smart-home reasoning model. "
+        "Explain this policy decision in exactly two short sentences for a live class demo.\n\n"
+        "Context:\n"
+        "- Room: media room\n"
+        f"- Home Assistant light entity: {DEMO_MEDIA_LIGHT_ENTITY}\n"
+        f"- Current light state: {state}\n"
+        "- New event: 10 minutes have passed since the motion event\n"
+        "- Current occupancy signal: no motion for 10 minutes, so the room is considered vacant\n"
+        "- Energy policy: if a room is vacant and a nonessential light is on, "
+        "recommend turning it off.\n\n"
+        f"Required decision: {recommended_action}. "
+        "If the required decision is turn_off, say the light should be off. "
+        "Do not mention implementation details."
+    )
+    client = LLMClient()
+    try:
+        response = await client.generate(
+            prompt,
+            system="You produce concise smart-home reasoning for EcoNest demos.",
+            temperature=0.2,
+            max_retries=1,
+        )
+    except Exception as exc:
+        response = (
+            "The media room is vacant and the light is nonessential, so the light "
+            "should be turned off to save energy."
+        )
+        source = "fallback"
+        warning = str(exc)
+    else:
+        source = "ollama"
+        warning = None
+    finally:
+        await client.close()
+
+    raw_reasoning = response.strip()
+    reasoning = _guard_light_policy_reasoning(
+        raw_reasoning,
+        state,
+        recommended_action,
+    )
+    if reasoning != raw_reasoning and source == "ollama":
+        source = "policy_guarded_ollama"
+        warning = "Ollama response contradicted the required policy decision."
+
+    return {
+        "agent": "llm",
+        "source": source,
+        "model_reasoning": raw_reasoning,
+        "summary": reasoning,
+        "observed_state": state,
+        "recommended_action": recommended_action,
+        "warning": warning,
+    }
+
+
+def _guard_light_policy_reasoning(
+    reasoning: str,
+    state: str,
+    recommended_action: str,
+) -> str:
+    fallback = (
+        "The media room is now considered vacant, and the nonessential light is "
+        f"currently {state}. EcoNest should turn it off to avoid wasting energy."
+    )
+    if not reasoning:
+        return fallback
+
+    normalized = reasoning.lower()
+    says_keep_on = any(
+        phrase in normalized
+        for phrase in (
+            "remain on",
+            "stay on",
+            "keep on",
+            "keep the light on",
+            "should be on",
+            "should remain on",
+        )
+    )
+    says_turn_off = any(
+        phrase in normalized
+        for phrase in (
+            "turn it off",
+            "turn off",
+            "should be off",
+            "switch it off",
+            "shut off",
+        )
+    )
+
+    if recommended_action == "turn_off" and (says_keep_on or not says_turn_off):
+        return fallback
+    return reasoning
+
+
+def _event(
+    event_type: str,
+    title: str,
+    message: str,
+    details: dict[str, Any] | None = None,
+    ok: bool = True,
+) -> str:
+    payload = {
+        "type": event_type,
+        "title": title,
+        "message": message,
+        "ok": ok,
+        "details": details or {},
+    }
+    return f"data: {json.dumps(payload, default=str)}\n\n"
+
+
+def _state_summary(state_result: dict[str, Any]) -> str:
+    if not state_result.get("success"):
+        warnings = state_result.get("warnings") or ["Home Assistant state unavailable"]
+        return "; ".join(str(warning) for warning in warnings)
+
+    result = state_result.get("result")
+    if not isinstance(result, dict):
+        return "Home Assistant returned a state response."
+
+    entity_id = result.get("entity_id", DEMO_MEDIA_LIGHT_ENTITY)
+    state = result.get("state", "unknown")
+    return f"{entity_id} is currently {state}."
+
+
+def _climate_snapshot_summary(
+    thermostat_state: dict[str, Any],
+    temperature_state: dict[str, Any],
+    humidity_state: dict[str, Any],
+) -> str:
+    hvac_mode = _ha_state_value(thermostat_state)
+    current_temperature = _ha_state_value(temperature_state)
+    humidity = _ha_state_value(humidity_state)
+    target = _ha_attribute_value(thermostat_state, "temperature")
+    return (
+        f"Media room is {current_temperature} F with {humidity}% humidity; "
+        f"thermostat is {hvac_mode} with target {target} F."
+    )
+
+
+def _thermostat_target_summary(state_result: dict[str, Any]) -> str:
+    target = _ha_attribute_value(state_result, "temperature")
+    hvac_mode = _ha_state_value(state_result)
+    return f"{DEMO_MEDIA_THERMOSTAT_ENTITY} is {hvac_mode} with target {target} F."
+
+
+def _ha_state_value(state_result: dict[str, Any] | None) -> str:
+    if not state_result:
+        return "unknown"
+    result = state_result.get("result")
+    if not isinstance(result, dict):
+        return "unknown"
+    return str(result.get("state", "unknown"))
+
+
+def _ha_attribute_value(state_result: dict[str, Any] | None, key: str) -> Any:
+    if not state_result:
+        return None
+    result = state_result.get("result")
+    if not isinstance(result, dict):
+        return None
+    attributes = result.get("attributes")
+    if not isinstance(attributes, dict):
+        return None
+    return attributes.get(key)
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _bounded_temperature(value: float) -> float:
+    bounded = max(
+        DEMO_THERMOSTAT_MIN_SETPOINT,
+        min(DEMO_THERMOSTAT_MAX_SETPOINT, float(value)),
+    )
+    return round(bounded, 1)
+
+
+def _agent_summary(result: Result) -> str:
+    if not result.success:
+        return result.message or "The selected agent failed to complete the task."
+
+    verified = result.metadata.get("verified")
+    source = result.metadata.get("execution_source", "agent")
+    return (
+        f"{result.agent or 'Agent'} completed the task through {source}; "
+        f"verified={verified}, confidence={result.confidence}."
+    )
+
+
+def _entity_summary(item: dict[str, Any]) -> dict[str, Any]:
+    attributes = item.get("attributes")
+    if not isinstance(attributes, dict):
+        attributes = {}
+    return {
+        "entity_id": item.get("entity_id"),
+        "name": attributes.get("friendly_name") or item.get("entity_id"),
+        "state": item.get("state"),
+    }
+
+
+def _numeric_sensor_summary(item: dict[str, Any]) -> dict[str, Any]:
+    summary = _entity_summary(item)
+    summary["value"] = _float_or_none(item.get("state")) or 0.0
+    return summary
+
+
+def _entity_text(item: dict[str, Any]) -> str:
+    attributes = item.get("attributes")
+    if not isinstance(attributes, dict):
+        attributes = {}
+    return f"{item.get('entity_id', '')} {attributes.get('friendly_name', '')}".lower()
+
+
+def _occupancy_status(people: list[dict[str, Any]]) -> str:
+    if not people:
+        return "unknown"
+    if any(str(person.get("state", "")).lower() == "home" for person in people):
+        return "home"
+    if all(
+        str(person.get("state", "")).lower() in {"not_home", "away"}
+        for person in people
+    ):
+        return "away"
+    return "mixed"
+
+
+def _record_occupancy_observation(status: str) -> dict[str, Any] | None:
+    previous = _feedback_memory.get("last_occupancy")
+    _feedback_memory["observation_count"] = int(_feedback_memory["observation_count"]) + 1
+    _feedback_memory["last_occupancy"] = status
+    if previous is None or previous == status:
+        return None
+    transition = {
+        "from": previous,
+        "to": status,
+        "observation": _feedback_memory["observation_count"],
+    }
+    _feedback_memory["transitions"].append(transition)
+    return transition
