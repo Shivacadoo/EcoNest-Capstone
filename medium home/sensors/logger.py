@@ -9,7 +9,10 @@ import os
 from dotenv import load_dotenv
 from kasa import SmartPlug
 
-load_dotenv()
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_ENV = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".env"))
+load_dotenv(ROOT_ENV)
+load_dotenv(override=False)
 
 # ── Configuration ──────────────────────────────────────────────
 HA_URL = os.getenv("HA_URL", "http://100.92.98.121:8123")
@@ -18,7 +21,10 @@ HA_TOKEN = os.getenv("HA_TOKEN")
 if not HA_TOKEN:
     raise ValueError("HA_TOKEN not found in .env file — please add it")
 
-BACKEND_URL = "http://127.0.0.1:5000/readings/add"
+ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://127.0.0.1:8001").rstrip("/")
+BACKEND_URL = os.getenv("BACKEND_URL", f"{ORCHESTRATOR_URL}/readings/add")
+SERVICE_ACCOUNT_TOKEN = os.getenv("SERVICE_ACCOUNT_TOKEN")
+LEGACY_API_KEY = os.getenv("LEGACY_API_KEY")
 
 # Sutton's Home
 HOME_ID = 1
@@ -63,10 +69,24 @@ HA_HEADERS = {
 }
 
 
+BACKEND_HEADERS = {"Content-Type": "application/json"}
+if SERVICE_ACCOUNT_TOKEN:
+    BACKEND_HEADERS["Authorization"] = f"Bearer {SERVICE_ACCOUNT_TOKEN}"
+elif LEGACY_API_KEY:
+    BACKEND_HEADERS["X-API-Key"] = LEGACY_API_KEY
+
+BACKEND_HEADERS["X-Service-Name"] = "logger"
+
+
 # ── Helpers ────────────────────────────────────────────────────
 def post_readings(payload):
     try:
-        resp = requests.post(BACKEND_URL, json=payload, timeout=5)
+        resp = requests.post(
+            BACKEND_URL,
+            json=payload,
+            headers=BACKEND_HEADERS,
+            timeout=5,
+        )
         print(f"[POST] status={resp.status_code}")
 
         # Try to print backend response for debugging

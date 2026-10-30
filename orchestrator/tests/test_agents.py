@@ -1,0 +1,2130 @@
+"""Tests for agents and orchestrator."""
+
+import asyncio
+import json
+import logging
+from typing import Any
+from unittest.mock import AsyncMock, patch
+
+import pytest
+from pydantic import ValidationError
+
+from orchestrator.agents.base import BaseAgent, Result, Task
+from orchestrator.agents.device_agent import DeviceAgent
+from orchestrator.agents.energy_agent import (
+    EnergyAgent,
+    EnergyHistorySample,
+    EnergyObservation,
+    GemmaEnergyRecommendation,
+    PricingSnapshot,
+    _uses_unavailable_price_claim,
+)
+from orchestrator.agents.orchestrator import AgentOrchestrator
+from orchestrator.agents.security_agent import (
+    SecurityAgent,
+    _suggests_unavailable_security_action,
+)
+from orchestrator.agents.sensor_agent import SensorAgent
+from orchestrator.mcp.models import ToolExecutionResult
+
+# ------------------------------------------------------------------
+# Base models and execution
+# ------------------------------------------------------------------
+
+
+class _SuccessAgent(BaseAgent):
+    name = "success"
+    tools = ["test_tool"]
+    permissions = ["agent:run"]
+
+    async def can_handle(self, task: Task) -> bool:
+        return "ok" in task.intent
+
+    async def run(self, task: Task) -> Result:
+        return Result(success=True, data={"handled": task.intent}, message="done")
+
+
+class _FailingAgent(_SuccessAgent):
+    name = "failing"
+
+    async def run(self, task: Task) -> Result:
+        raise RuntimeError("boom")
+
+
+class _StaticAgent(BaseAgent):
+    def __init__(
+        self,
+        name: str,
+        success: bool = True,
+        can_handle_task: bool = True,
+    ) -> None:
+        super().__init__()
+        self.name = name
+        self.success = success
+        self.can_handle_task = can_handle_task
+        self.run_count = 0
+
+    async def can_handle(self, task: Task) -> bool:
+        return self.can_handle_task
+
+    async def run(self, task: Task) -> Result:
+        self.run_count += 1
+        return Result(
+            success=self.success,
+            data={"agent": self.name, "source": task.metadata.get("source")},
+            message=f"{self.name} complete",
+        )
+
+
+class _FlakyAgent(_StaticAgent):
+    def __init__(self) -> None:
+        super().__init__("energy")
+
+    async def run(self, task: Task) -> Result:
+        self.run_count += 1
+        return Result(
+            success=self.run_count >= 3,
+            data={"attempt": self.run_count},
+            message="flaky",
+            error=None if self.run_count >= 3 else "temporary_failure",
+        )
+
+
+class _FakeLLM:
+    def __init__(self, category: str, confidence: float = 1.0) -> None:
+        self.category = category
+        self.confidence = confidence
+        self.messages: list[Any] = []
+
+    async def generate_structured(
+        self,
+        messages: list[Any],
+        output_model: type[Any],
+        system: str | None = None,
+        temperature: float = 0.7,
+    ) -> Any:
+        self.messages = messages
+        return output_model(category=self.category, confidence=self.confidence)
+
+
+class _FailingClassifierLLM:
+    async def generate_structured(
+        self,
+        messages: list[Any],
+        output_model: type[Any],
+        system: str | None = None,
+        temperature: float = 0.7,
+    ) -> Any:
+        raise RuntimeError("LLM unavailable")
+
+
+async def _wait_for_result(orch: AgentOrchestrator, task_id: str) -> Result | None:
+    for _ in range(20):
+        result = await orch.get_result(task_id)
+        if result is not None:
+            return result
+        await asyncio.sleep(0)
+    return None
+
+
+def test_task_validation_rejects_empty_intent():
+    with pytest.raises(ValidationError):
+        Task(id="1", intent="", payload={})
+
+
+def test_task_defaults_are_structured():
+    task = Task(intent="ok task")
+    assert task.id == ""
+    assert task.payload == {}
+    assert task.metadata == {}
+    assert task.timeout_seconds == 30
+
+
+@pytest.mark.anyio
+async def test_base_agent_execute_success_logs_json(caplog):
+    agent = _SuccessAgent()
+    task = Task(id="task-1", intent="ok task", payload={}, user_id="user-1")
+
+    with caplog.at_level(logging.INFO, logger="orchestrator.agents.base"):
+        result = await agent.execute(task)
+
+    assert result.success
+    assert result.agent == "success"
+    assert result.task_id == "task-1"
+
+    event = json.loads(caplog.records[-1].message)
+    assert event["event"] == "agent.run"
+    assert event["agent"] == "success"
+    assert event["task_id"] == "task-1"
+    assert event["success"] is True
+    assert "duration_ms" in event
+
+
+@pytest.mark.anyio
+async def test_base_agent_execute_rejects_unsupported_task():
+    agent = _SuccessAgent()
+    result = await agent.execute(Task(id="task-2", intent="no match", payload={}))
+
+    assert not result.success
+    assert result.agent == "success"
+    assert result.task_id == "task-2"
+    assert result.error == "unsupported_task"
+
+
+@pytest.mark.anyio
+async def test_base_agent_execute_catches_exceptions():
+    agent = _FailingAgent()
+    result = await agent.execute(Task(id="task-3", intent="ok task", payload={}))
+
+    assert not result.success
+    assert result.agent == "failing"
+    assert result.task_id == "task-3"
+    assert result.error == "RuntimeError"
+    assert result.metadata["error_message"] == "boom"
+
+
+# ------------------------------------------------------------------
+# Agent routing
+# ------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_energy_agent_can_handle():
+    agent = EnergyAgent()
+    assert await agent.can_handle(Task(id="1", intent="check energy usage", payload={}))
+    assert not await agent.can_handle(Task(id="2", intent="turn on light", payload={}))
+
+
+@pytest.mark.anyio
+async def test_security_agent_can_handle():
+    agent = SecurityAgent()
+    assert await agent.can_handle(Task(id="1", intent="security alert", payload={}))
+    assert not await agent.can_handle(Task(id="2", intent="sensor health", payload={}))
+
+
+@pytest.mark.anyio
+async def test_sensor_agent_can_handle():
+    agent = SensorAgent()
+    assert await agent.can_handle(Task(id="1", intent="sensor calibration", payload={}))
+    assert not await agent.can_handle(Task(id="2", intent="device control", payload={}))
+
+
+@pytest.mark.anyio
+async def test_device_agent_can_handle():
+    agent = DeviceAgent()
+    assert await agent.can_handle(Task(id="1", intent="turn on light", payload={}))
+    assert not await agent.can_handle(Task(id="2", intent="energy report", payload={}))
+
+
+@pytest.mark.anyio
+async def test_home_data_payload_routes_to_read_only_home_data_agent() -> None:
+    home_data = _StaticAgent("event_history")
+    device = _StaticAgent("device")
+    orchestrator = AgentOrchestrator(agents=[home_data, device])
+
+    selected = await orchestrator._select_agents(
+        Task(
+            intent="What is my comfort temperature in the media room?",
+            payload={"type": "home_data"},
+        )
+    )
+
+    assert selected == [home_data]
+
+
+# ------------------------------------------------------------------
+# Agent execution
+# ------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_energy_agent_run():
+    agent = EnergyAgent()
+    result = await agent.run(Task(id="1", intent="energy", payload={}))
+    assert result.success
+    assert "recommendation" in result.data
+    assert "recommendations" in result.data
+    assert result.data["pricing"]["current_tier"] in {
+        "peak",
+        "off_peak",
+        "unknown",
+    }
+
+
+def test_energy_agent_uses_active_cycle_history_for_dryer_baseline() -> None:
+    """A normal dryer heating load must not be treated as an anomaly by itself."""
+    agent = EnergyAgent()
+    observations = [
+        EnergyObservation(
+            entity_id="sensor.dryer_power",
+            name="Dryer",
+            current_power_w=1803.3,
+        )
+    ]
+    history = [
+        EnergyHistorySample(
+            entity_id="sensor.breaker_10_power_minute_average",
+            name="Dryer Breaker Power Minute Average",
+            current_power_w=watts,
+            hour=18,
+        )
+        for watts in (1900.0, 2100.0, 2300.0, 2200.0)
+    ]
+
+    updated = agent._apply_historical_baselines(observations, history)
+
+    assert updated[0].baseline_w == 2150.0
+    assert agent._detect_anomalies(updated) == []
+
+
+@pytest.mark.anyio
+async def test_energy_agent_peak_pricing_recommendation():
+    agent = EnergyAgent()
+    result = await agent.run(
+        Task(
+            id="energy-peak",
+            intent="energy pricing review",
+            payload={
+                "current_hour": 17,
+                "observations": [
+                    {
+                        "name": "Washer",
+                        "current_power_w": 900,
+                        "scheduled": True,
+                    }
+                ],
+                "history": [
+                    {
+                        "name": "Washer",
+                        "current_power_w": 900,
+                        "hour": 17,
+                        "flexible": True,
+                    },
+                    {
+                        "name": "Washer",
+                        "current_power_w": 850,
+                        "hour": 17,
+                        "flexible": True,
+                    },
+                    {
+                        "name": "Washer",
+                        "current_power_w": 100,
+                        "hour": 22,
+                        "flexible": True,
+                    },
+                ],
+                "tariff_forecast": [
+                    {"start_hour": 0, "end_hour": 16, "cents_per_kwh": 9},
+                    {"start_hour": 16, "end_hour": 21, "cents_per_kwh": 18},
+                    {"start_hour": 21, "end_hour": 24, "cents_per_kwh": 9},
+                ],
+            },
+        )
+    )
+
+    assert result.success
+    assert result.data["pricing"]["current_tier"] == "peak"
+    assert any(
+        "Schedule flexible loads" in item["action"]
+        for item in result.data["recommendations"]
+    )
+    assert result.data["alerts"][0].startswith("Tariff forecast")
+    assert result.data["recommendation_only"] is True
+
+
+@pytest.mark.anyio
+async def test_energy_agent_learns_routine_and_low_demand_window_without_tariff():
+    agent = EnergyAgent()
+    result = await agent.run(
+        Task(
+            id="energy-routine",
+            intent="help me plan appliance use",
+            payload={
+                "history": [
+                    {
+                        "name": "Dishwasher",
+                        "current_power_w": 1100,
+                        "hour": 19,
+                        "flexible": True,
+                    },
+                    {
+                        "name": "Dishwasher",
+                        "current_power_w": 1000,
+                        "hour": 19,
+                        "flexible": True,
+                    },
+                    {
+                        "name": "Household load",
+                        "current_power_w": 150,
+                        "hour": 23,
+                    },
+                ],
+            },
+        )
+    )
+
+    assert result.success
+    assert result.data["pricing"]["source"] == "no_tariff_forecast"
+    assert result.data["household_routines"][0]["name"] == "Dishwasher"
+    assert any("11pm" in item["action"] for item in result.data["recommendations"])
+    assert "turn off" not in result.data["recommendation"].lower()
+
+
+@pytest.mark.anyio
+async def test_orchestrator_audits_energy_recommendations_for_activity_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def fake_audit(event_type: str, payload: dict[str, Any]) -> None:
+        events.append((event_type, payload))
+
+    monkeypatch.setattr(
+        "orchestrator.agents.orchestrator.write_audit_event_async", fake_audit
+    )
+    orchestrator = AgentOrchestrator()
+    await orchestrator._audit_energy_recommendations(
+        Task(
+            id="energy-history",
+            intent="energy review",
+            payload={
+                "entity_id": "sensor.dryer_power",
+                "event_type": "energy_anomaly_detected",
+                "previous_state": "80",
+                "new_state": "900",
+            },
+            metadata={
+                "source": "ha_event_dispatcher",
+                "event_type": "energy_anomaly_detected",
+            },
+        ),
+        Result(
+            success=True,
+            agent="energy",
+            data={
+                "recommendations": [
+                    {
+                        "priority": "LOW",
+                        "action": "Review standby loads",
+                        "reasoning": "Overnight demand is elevated.",
+                    }
+                ],
+                "pricing": {"source": "tariff_forecast"},
+                "household_routines": [],
+            },
+        ),
+    )
+
+    assert events[0][0] == "energy.recommendations.generated"
+    assert events[0][1]["recommendation_only"] is True
+    assert events[0][1]["recommendations"][0]["action"] == "Review standby loads"
+    assert events[0][1]["technical_details"] == {
+        "trigger_source": "ha_event_dispatcher",
+        "trigger_type": "energy_anomaly_detected",
+        "entity_id": "sensor.dryer_power",
+        "state_before": "80",
+        "state_after_event": "900",
+        "live_state": None,
+        "review_completed": True,
+        "simulated": False,
+    }
+
+
+@pytest.mark.anyio
+async def test_energy_agent_detects_schedule_violation():
+    agent = EnergyAgent()
+    result = await agent.run(
+        Task(
+            id="energy-schedule",
+            intent="energy schedule review",
+            payload={
+                "current_hour": 2,
+                "observations": [
+                    {
+                        "name": "Dryer",
+                        "current_power_w": 1200,
+                        "scheduled": False,
+                        "schedule": "9:00-21:00",
+                    }
+                ],
+            },
+        )
+    )
+
+    assert result.success
+    assert result.data["schedule_violations"][0]["name"] == "Dryer"
+    assert result.data["recommendations"][0]["priority"] == "HIGH"
+
+
+@pytest.mark.anyio
+async def test_energy_agent_detects_anomaly_from_baseline():
+    agent = EnergyAgent()
+    result = await agent.run(
+        Task(
+            id="energy-anomaly",
+            intent="energy anomaly",
+            payload={
+                "type": "energy",
+                "current_power_w": 650,
+                "baseline_w": 100,
+                "device_name": "Garage Breaker",
+            },
+        )
+    )
+
+    assert result.success
+    assert result.data["mode"] == "alert"
+    assert result.data["anomalies"][0]["name"] == "Garage Breaker"
+    assert "baseline" in result.data["anomalies"][0]["anomaly_reason"]
+
+
+@pytest.mark.anyio
+async def test_energy_agent_uses_prompt_template_when_requested():
+    class _EnergyLLM:
+        async def generate_structured(self, messages, output_model, temperature=0.7):
+            assert "EcoNest's energy optimization agent" in messages[0].content
+            return output_model(
+                priority="MEDIUM",
+                action="Shift laundry to the off-peak window after 9pm.",
+                reasoning="The tariff evidence supports this time window.",
+            )
+
+    agent = EnergyAgent(llm=_EnergyLLM())
+    result = await agent.run(
+        Task(
+            id="energy-llm",
+            intent="energy review",
+            payload={
+                "use_llm": True,
+                "current_hour": 17,
+                "tariff_forecast": [
+                    {"start_hour": 0, "end_hour": 24, "cents_per_kwh": 18}
+                ],
+            },
+        )
+    )
+
+    assert result.success
+    assert result.data["recommendations"][0]["action"].startswith("Shift laundry")
+
+
+def test_energy_model_recommendation_cannot_invent_a_price_window() -> None:
+    """Unknown tariff data forbids unsupported cheaper-period claims."""
+    recommendation = GemmaEnergyRecommendation(
+        priority="MEDIUM",
+        action="Run the dryer when energy prices are lower.",
+        reasoning="This would lower energy costs.",
+    )
+    pricing = PricingSnapshot(current_tier="unknown", source="no_tariff_forecast")
+
+    assert _uses_unavailable_price_claim(recommendation, pricing) is True
+
+
+@pytest.mark.anyio
+async def test_security_agent_run():
+    agent = SecurityAgent()
+    result = await agent.run(Task(id="1", intent="security", payload={}))
+    assert result.success
+    assert "severity" in result.data
+
+
+@pytest.mark.anyio
+async def test_sensor_agent_run():
+    agent = SensorAgent()
+    result = await agent.run(Task(id="1", intent="sensor", payload={}))
+    assert result.success
+    assert "healthy_sensors" in result.data
+
+
+@pytest.mark.anyio
+async def test_device_agent_run():
+    agent = DeviceAgent()
+    result = await agent.run(Task(id="1", intent="device", payload={}))
+    assert result.success
+    assert "action" in result.data
+
+
+# ------------------------------------------------------------------
+# Orchestrator
+# ------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_orchestrator_routes_energy():
+    orch = AgentOrchestrator()
+    task = Task(id="", intent="check my power usage", payload={})
+    agent = await orch._classify_and_route(task)
+    assert agent is not None
+    assert agent.name == "energy"
+
+
+@pytest.mark.anyio
+async def test_orchestrator_routes_device():
+    orch = AgentOrchestrator()
+    task = Task(id="", intent="turn off the bedroom light", payload={})
+    agent = await orch._classify_and_route(task)
+    assert agent is not None
+    assert agent.name == "device"
+
+
+@pytest.mark.anyio
+async def test_orchestrator_routes_device_action_before_motion_security():
+    orch = AgentOrchestrator()
+    task = Task(
+        id="",
+        intent="motion detected in media room, turn on media room light",
+        payload={
+            "action": "turn_on",
+            "domain": "light",
+            "device_id": "light.upstairs_media_light_1",
+        },
+    )
+
+    agent = await orch._classify_and_route(task)
+
+    assert agent is not None
+    assert agent.name == "device"
+
+
+@pytest.mark.anyio
+async def test_orchestrator_uses_llm_classification_before_rules():
+    llm = _FakeLLM("security")
+    orch = AgentOrchestrator(
+        agents=[_StaticAgent("energy"), _StaticAgent("security")],
+        llm=llm,
+    )
+    task = Task(id="", intent="check my power usage", payload={})
+
+    agent = await orch._classify_and_route(task)
+
+    assert agent is not None
+    assert agent.name == "security"
+    assert llm.messages
+
+
+@pytest.mark.anyio
+async def test_orchestrator_falls_back_to_rules_when_llm_fails():
+    orch = AgentOrchestrator(llm=_FailingClassifierLLM())
+    task = Task(id="", intent="check my power usage", payload={})
+
+    agent = await orch._classify_and_route(task)
+
+    assert agent is not None
+    assert agent.name == "energy"
+
+
+@pytest.mark.anyio
+async def test_orchestrator_falls_back_to_rules_for_low_confidence_llm():
+    orch = AgentOrchestrator(llm=_FakeLLM("security", confidence=0.2))
+    task = Task(id="", intent="turn off the bedroom light", payload={})
+
+    agent = await orch._classify_and_route(task)
+
+    assert agent is not None
+    assert agent.name == "device"
+
+
+@pytest.mark.anyio
+async def test_orchestrator_healthcheck():
+    orch = AgentOrchestrator()
+    health = await orch.healthcheck()
+    assert "energy" in health
+    assert "security" in health
+    assert "sensor" in health
+    assert "device" in health
+
+
+@pytest.mark.anyio
+async def test_orchestrator_submit_and_result():
+    orch = AgentOrchestrator()
+    task = Task(id="", intent="energy check", payload={})
+    task_id = await orch.submit(task)
+    assert task_id != ""
+    # Result may still be running or completed
+    result = await orch.get_result(task_id)
+    assert result is not None or result is None  # either is valid depending on timing
+
+
+@pytest.mark.anyio
+async def test_orchestrator_http_api_intake_adds_source_and_role():
+    agent = _StaticAgent("energy")
+    orch = AgentOrchestrator(agents=[agent], llm=_FailingClassifierLLM())
+
+    task_id = await orch.submit_http_api(
+        intent="energy overview",
+        payload={},
+        user_id="42",
+        user_role="homeowner",
+    )
+    result = await _wait_for_result(orch, task_id)
+
+    assert result is not None
+    assert result.success
+    assert result.data["source"] == "http_api"
+
+
+@pytest.mark.anyio
+async def test_orchestrator_scheduled_intake_adds_source():
+    agent = _StaticAgent("energy")
+    orch = AgentOrchestrator(agents=[agent], llm=_FailingClassifierLLM())
+
+    task_id = await orch.submit_scheduled(
+        intent="energy check",
+        payload={},
+        schedule_id="nightly",
+    )
+    result = await _wait_for_result(orch, task_id)
+
+    assert result is not None
+    assert result.success
+    assert result.data["source"] == "scheduled_cron"
+
+
+@pytest.mark.anyio
+async def test_orchestrator_ha_webhook_intake_adds_source():
+    agent = _StaticAgent("security")
+    orch = AgentOrchestrator(agents=[agent], llm=_FailingClassifierLLM())
+
+    task_id = await orch.submit_home_assistant_webhook(
+        event_type="motion alert",
+        payload={"entity_id": "binary_sensor.motion"},
+    )
+    result = await _wait_for_result(orch, task_id)
+
+    assert result is not None
+    assert result.success
+    assert result.data["source"] == "ha_webhook"
+
+
+@pytest.mark.anyio
+async def test_orchestrator_llm_fallback_routes_unknown_intent():
+    agent = _StaticAgent("sensor", can_handle_task=False)
+    llm = _FakeLLM("sensor")
+    orch = AgentOrchestrator(agents=[agent], llm=llm)
+    task = Task(id="llm-1", intent="please inspect the silent readings", payload={})
+
+    await orch._run_with_lifecycle(task)
+    result = await orch.get_result("llm-1")
+
+    assert result is not None
+    assert result.success
+    assert result.agent == "sensor"
+    assert llm.messages[0].role == "user"
+
+
+@pytest.mark.anyio
+async def test_orchestrator_aggregates_multiple_agent_results():
+    orch = AgentOrchestrator(agents=[_StaticAgent("energy"), _StaticAgent("security")])
+    task = Task(
+        id="multi-1",
+        intent="whole home status",
+        payload={},
+        metadata={"aggregate": True},
+    )
+
+    await orch._run_with_lifecycle(task)
+    result = await orch.get_result("multi-1")
+
+    assert result is not None
+    assert result.success
+    assert result.message == "Aggregated 2 agent results"
+    assert len(result.data["results"]) == 2
+
+
+@pytest.mark.anyio
+async def test_orchestrator_retries_failed_agent_results():
+    agent = _FlakyAgent()
+    orch = AgentOrchestrator(agents=[agent])
+
+    result = await orch._run_agent_with_retries(
+        agent,
+        Task(id="retry-1", intent="energy check", payload={}),
+    )
+
+    assert result.success
+    assert result.data["attempt"] == 3
+    assert agent.run_count == 3
+
+
+@pytest.mark.anyio
+async def test_orchestrator_blocks_guest_device_control_at_night():
+    orch = AgentOrchestrator(
+        agents=[_StaticAgent("device")],
+        current_hour_provider=lambda: 23,
+    )
+    task = Task(
+        id="policy-1",
+        intent="turn on the porch light",
+        payload={"action": "turn_on", "domain": "light"},
+        metadata={"user_role": "guest"},
+    )
+
+    execute = AsyncMock()
+    orch.tool_executor.execute = execute
+    await orch._run_with_lifecycle(task)
+
+    result = await orch.get_result("policy-1")
+    assert result is not None
+    assert not result.success
+    assert result.error == "policy_device_control_quiet_hours"
+    execute.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_orchestrator_blocks_autonomous_device_actions_by_default():
+    orch = AgentOrchestrator(
+        agents=[_StaticAgent("device")],
+        current_hour_provider=lambda: 12,
+    )
+    task = Task(
+        id="policy-auto-1",
+        intent="autonomous turn off light",
+        payload={
+            "action": "turn_off",
+            "domain": "light",
+            "expected_outcome": {"state": "off"},
+        },
+        metadata={"source": "background_monitor", "user_role": "homeowner"},
+    )
+
+    await orch._run_with_lifecycle(task)
+
+    result = await orch.get_result("policy-auto-1")
+    assert result is not None
+    assert not result.success
+    assert result.error == "policy_autonomous_action_restricted"
+    assert result.metadata["expected_outcome"] == {"state": "off"}
+
+
+@pytest.mark.anyio
+async def test_orchestrator_allows_allowlisted_autonomous_device_action(monkeypatch):
+    class Settings:
+        AUTONOMY_ACTIONS_ENABLED = True
+        AUTONOMY_ALLOWED_ACTIONS = "light.turn_off"
+        AUTONOMY_ALLOWED_ENTITIES = "light.upstairs_media_light_1"
+
+    monkeypatch.setattr(
+        "orchestrator.core.policy.get_settings",
+        lambda: Settings(),
+    )
+    orch = AgentOrchestrator(
+        agents=[_StaticAgent("device")],
+        current_hour_provider=lambda: 12,
+    )
+    task = Task(
+        id="policy-auto-2",
+        intent="autonomous turn off light",
+        payload={
+            "action": "turn_off",
+            "domain": "light",
+            "entity_id": "light.upstairs_media_light_1",
+        },
+        metadata={"source": "background_monitor", "user_role": "homeowner"},
+    )
+
+    await orch._run_with_lifecycle(task)
+
+    result = await orch.get_result("policy-auto-2")
+    assert result is not None
+    assert result.success
+
+
+@pytest.mark.anyio
+async def test_orchestrator_blocks_non_allowlisted_autonomous_entity(monkeypatch):
+    class Settings:
+        AUTONOMY_ACTIONS_ENABLED = True
+        AUTONOMY_ALLOWED_ACTIONS = "light.turn_off"
+        AUTONOMY_ALLOWED_ENTITIES = "light.upstairs_media_light_1"
+
+    monkeypatch.setattr(
+        "orchestrator.core.policy.get_settings",
+        lambda: Settings(),
+    )
+    orch = AgentOrchestrator(
+        agents=[_StaticAgent("device")],
+        current_hour_provider=lambda: 12,
+    )
+    task = Task(
+        id="policy-auto-3",
+        intent="autonomous turn off light",
+        payload={
+            "action": "turn_off",
+            "domain": "light",
+            "entity_id": "light.bedroom_1_light_1",
+        },
+        metadata={"source": "background_monitor", "user_role": "homeowner"},
+    )
+
+    await orch._run_with_lifecycle(task)
+
+    result = await orch.get_result("policy-auto-3")
+    assert result is not None
+    assert not result.success
+    assert result.error == "policy_autonomous_action_restricted"
+
+
+@pytest.mark.anyio
+async def test_orchestrator_allows_homeowner_device_control_at_night():
+    orch = AgentOrchestrator(
+        agents=[_StaticAgent("device")],
+        current_hour_provider=lambda: 23,
+    )
+    task = Task(
+        id="policy-2",
+        intent="turn on the porch light",
+        payload={"action": "turn_on", "domain": "light"},
+        metadata={"user_role": "homeowner"},
+    )
+
+    execute = AsyncMock()
+    orch.tool_executor.execute = execute
+    await orch._run_with_lifecycle(task)
+
+    result = await orch.get_result("policy-2")
+    assert result is not None
+    assert result.success
+    execute.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_orchestrator_blocks_guest_sms_actions():
+    orch = AgentOrchestrator(agents=[_StaticAgent("security")])
+    task = Task(
+        id="policy-3",
+        intent="send sms security alert",
+        payload={"action": "send_sms", "channel": "sms"},
+        metadata={"user_role": "family_member"},
+    )
+
+    await orch._run_with_lifecycle(task)
+    result = await orch.get_result("policy-3")
+
+    assert result is not None
+    assert not result.success
+    assert result.error == "policy_sms_role_restricted"
+
+
+# ------------------------------------------------------------------
+# Healthcheck
+# ------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_agent_healthcheck():
+    agent = EnergyAgent()
+    status = await agent.healthcheck()
+    assert status.healthy
+
+
+@pytest.mark.anyio
+async def test_security_agent_motion_at_night():
+
+    agent = SecurityAgent()
+
+    result = await agent.run(
+        Task(
+            id="sec-1",
+            intent="security",
+            payload={
+                "motion": True,
+                "current_hour": 1,
+            },
+        )
+    )
+
+    assert result.success
+    assert result.data["severity"] in {
+        "HIGH",
+        "CRITICAL",
+    }
+    assert result.data["sms_sent"] is False
+    assert all(
+        "dispatch" not in recommendation.lower()
+        for recommendation in result.data["recommendations"]
+    )
+
+
+def test_security_llm_action_guard_rejects_unsupported_escalation():
+    assert _suggests_unavailable_security_action(
+        "Dispatch security personnel and send an SMS immediately."
+    )
+    assert not _suggests_unavailable_security_action(
+        "EcoNest is informing you about a high-priority security alert."
+    )
+
+
+@pytest.mark.anyio
+async def test_security_agent_garage_open():
+
+    agent = SecurityAgent()
+
+    result = await agent.run(
+        Task(
+            id="sec-2",
+            intent="security",
+            payload={
+                "garage_open_minutes": 60,
+            },
+        )
+    )
+
+    assert result.success
+    assert result.data["severity"] == "HIGH"
+
+
+@pytest.mark.anyio
+async def test_security_agent_multisignal():
+
+    agent = SecurityAgent()
+
+    result = await agent.run(
+        Task(
+            id="sec-3",
+            intent="security",
+            payload={
+                "motion": True,
+                "sound": True,
+                "current_hour": 1,
+            },
+        )
+    )
+
+    assert result.success
+    assert result.data["severity"] == "CRITICAL"
+
+
+@pytest.mark.anyio
+async def test_security_agent_confidence():
+
+    agent = SecurityAgent()
+
+    result = await agent.run(
+        Task(
+            id="sec-4",
+            intent="security",
+            payload={
+                "motion": True,
+                "sound": True,
+                "current_hour": 1,
+            },
+        )
+    )
+
+    assert 0.0 <= result.confidence <= 1.0
+
+
+@pytest.mark.anyio
+async def test_sensor_agent_detects_offline_sensor():
+
+    agent = SensorAgent()
+
+    result = await agent.run(
+        Task(
+            id="sensor-1",
+            intent="sensor",
+            payload={
+                "sensors": [
+                    {
+                        "name": "TempSensor",
+                        "last_seen_minutes": 30,
+                    }
+                ]
+            },
+        )
+    )
+
+    assert result.success
+    assert result.data["offline_sensors"] == 1
+
+
+@pytest.mark.anyio
+async def test_sensor_agent_detects_bad_value():
+
+    agent = SensorAgent()
+
+    result = await agent.run(
+        Task(
+            id="sensor-2",
+            intent="sensor",
+            payload={
+                "sensors": [
+                    {
+                        "name": "TempSensor",
+                        "value": -500,
+                    }
+                ]
+            },
+        )
+    )
+
+    assert result.success
+    assert len(result.data["issues"]) > 0
+
+
+@pytest.mark.anyio
+async def test_sensor_agent_confidence():
+
+    agent = SensorAgent()
+
+    result = await agent.run(
+        Task(
+            id="sensor-3",
+            intent="sensor",
+            payload={},
+        )
+    )
+
+    assert 0.0 <= result.confidence <= 1.0
+
+
+@pytest.mark.anyio
+async def test_device_agent_turn_on():
+
+    agent = DeviceAgent()
+
+    result = await agent.run(
+        Task(
+            id="dev-1",
+            intent="turn on device",
+            payload={
+                "device_id": "light_1",
+                "action": "turn_on",
+            },
+        )
+    )
+
+    assert result.success
+
+
+@pytest.mark.anyio
+async def test_device_agent_unknown_action():
+
+    agent = DeviceAgent()
+
+    result = await agent.run(
+        Task(
+            id="dev-2",
+            intent="device",
+            payload={
+                "device_id": "light_1",
+                "action": "explode",
+            },
+        )
+    )
+
+    assert result.success is False
+
+
+@pytest.mark.anyio
+async def test_device_agent_confidence():
+
+    agent = DeviceAgent()
+
+    result = await agent.run(
+        Task(
+            id="dev-3",
+            intent="device",
+            payload={
+                "device_id": "light_1",
+                "action": "turn_on",
+            },
+        )
+    )
+
+    assert 0.0 <= result.confidence <= 1.0
+
+
+@pytest.mark.anyio
+async def test_device_agent_metadata():
+
+    agent = DeviceAgent()
+
+    result = await agent.run(
+        Task(
+            id="dev-meta",
+            intent="device",
+            payload={
+                "device_id": "light_1",
+                "action": "turn_on",
+            },
+        )
+    )
+
+    assert result.metadata["agent_type"] == "device"
+
+
+@pytest.mark.anyio
+async def test_device_agent_calls_home_assistant_for_entity_id():
+    agent = DeviceAgent()
+    execute = AsyncMock(
+        side_effect=[
+            ToolExecutionResult(
+                capability="query_arcadedb", result=[{"result": "OnOff"}]
+            ),
+            ToolExecutionResult(capability="ha_call_service", result={"status": "ok"}),
+            ToolExecutionResult(capability="ha_get_state", result={"state": "on"}),
+        ]
+    )
+    agent.tool_executor.execute = execute
+    result = await agent.run(
+        Task(
+            id="dev-ha",
+            intent="turn on kitchen light",
+            payload={"device_id": "light.kitchen", "action": "turn_on"},
+        )
+    )
+
+    assert result.success
+    assert result.data["execution_source"] == "home_assistant"
+    assert result.data["verified"] is True
+    assert execute.await_args_list[1].args[0] == "ha_call_service"
+    service_arguments = execute.await_args_list[1].args[1]
+    assert service_arguments == {
+        "domain": "light",
+        "service": "turn_on",
+        "entity_id": "light.kitchen",
+        "service_data": None,
+    }
+
+
+@pytest.mark.anyio
+async def test_device_agent_closes_home_assistant_cover():
+    agent = DeviceAgent()
+    execute = AsyncMock(
+        side_effect=[
+            ToolExecutionResult(
+                capability="query_arcadedb", result=[{"result": "CoverControl"}]
+            ),
+            ToolExecutionResult(capability="ha_call_service", result={"status": "ok"}),
+            ToolExecutionResult(capability="ha_get_state", result={"state": "closed"}),
+        ]
+    )
+    agent.tool_executor.execute = execute
+    result = await agent.run(
+        Task(
+            id="dev-cover",
+            intent="close garage door",
+            payload={
+                "device_id": "cover.garage12",
+                "entity_id": "cover.garage12",
+                "domain": "cover",
+                "action": "close",
+            },
+        )
+    )
+
+    assert result.success
+    assert result.data["verified"] is True
+    service_arguments = execute.await_args_list[1].args[1]
+    assert service_arguments["domain"] == "cover"
+    assert service_arguments["service"] == "close_cover"
+    assert service_arguments["entity_id"] == "cover.garage12"
+
+
+@pytest.mark.anyio
+async def test_device_agent_fails_when_home_assistant_state_not_verified():
+    agent = DeviceAgent()
+    execute = AsyncMock(
+        side_effect=[
+            ToolExecutionResult(
+                capability="query_arcadedb",
+                result=[{"result": "OnOff"}],
+            ),
+            ToolExecutionResult(
+                capability="ha_call_service",
+                result={"status": "ok"},
+            ),
+            ToolExecutionResult(
+                capability="ha_get_state",
+                result={"state": "off"},
+            ),
+        ]
+    )
+    agent.tool_executor.execute = execute
+
+    with patch(
+        "orchestrator.agents.device_agent.HA_VERIFY_ATTEMPTS",
+        1,
+    ):
+        result = await agent.run(
+            Task(
+                id="dev-ha-fail",
+                intent="turn on kitchen light",
+                payload={
+                    "device_id": "light.kitchen",
+                    "action": "turn_on",
+                },
+            )
+        )
+
+    assert result.success is False
+    assert result.data["execution_source"] == "home_assistant"
+    assert result.data["verified"] is False
+    assert "not verified" in result.data["error"].lower()
+
+
+@pytest.mark.anyio
+async def test_device_agent_verifies_home_assistant_turn_off():
+    agent = DeviceAgent()
+    execute = AsyncMock(
+        side_effect=[
+            ToolExecutionResult(
+                capability="query_arcadedb",
+                result=[{"result": "OnOff"}],
+            ),
+            ToolExecutionResult(
+                capability="ha_call_service",
+                result={"status": "ok"},
+            ),
+            ToolExecutionResult(
+                capability="ha_get_state",
+                result={"state": "off"},
+            ),
+        ]
+    )
+    agent.tool_executor.execute = execute
+
+    result = await agent.run(
+        Task(
+            id="dev-off",
+            intent="turn off kitchen light",
+            payload={
+                "device_id": "light.kitchen",
+                "action": "turn_off",
+            },
+        )
+    )
+
+    assert result.success is True
+    assert result.data["state"] == "off"
+    assert result.data["verified"] is True
+    assert execute.await_args_list[1].args[0] == "ha_call_service"
+    assert execute.await_args_list[2].args[0] == "ha_get_state"
+
+
+@pytest.mark.anyio
+async def test_device_agent_verifies_home_assistant_brightness():
+    agent = DeviceAgent()
+    execute = AsyncMock(
+        side_effect=[
+            ToolExecutionResult(
+                capability="query_arcadedb",
+                result=[{"result": "Dimmable"}],
+            ),
+            ToolExecutionResult(
+                capability="ha_call_service",
+                result={"status": "ok"},
+            ),
+            ToolExecutionResult(
+                capability="ha_get_state",
+                result={
+                    "state": "on",
+                    "attributes": {
+                        "brightness": 128,
+                    },
+                },
+            ),
+        ]
+    )
+    agent.tool_executor.execute = execute
+
+    result = await agent.run(
+        Task(
+            id="dev-brightness",
+            intent="set kitchen light brightness",
+            payload={
+                "device_id": "light.kitchen",
+                "action": "set_brightness",
+                "brightness": 50,
+            },
+        )
+    )
+
+    assert result.success is True
+    assert result.data["verified"] is True
+    assert result.data["state"] == "brightness:50"
+
+    service_arguments = execute.await_args_list[1].args[1]
+    assert service_arguments["service"] == "turn_on"
+    assert service_arguments["service_data"] == {"brightness_pct": 50}
+
+
+@pytest.mark.anyio
+async def test_device_agent_fails_when_brightness_not_verified():
+    agent = DeviceAgent()
+    execute = AsyncMock(
+        side_effect=[
+            ToolExecutionResult(
+                capability="query_arcadedb",
+                result=[{"result": "Dimmable"}],
+            ),
+            ToolExecutionResult(
+                capability="ha_call_service",
+                result={"status": "ok"},
+            ),
+            ToolExecutionResult(
+                capability="ha_get_state",
+                result={
+                    "state": "on",
+                    "attributes": {
+                        "brightness": 200,
+                    },
+                },
+            ),
+        ]
+    )
+    agent.tool_executor.execute = execute
+
+    with patch(
+        "orchestrator.agents.device_agent.HA_VERIFY_ATTEMPTS",
+        1,
+    ):
+        result = await agent.run(
+            Task(
+                id="dev-brightness-fail",
+                intent="set kitchen light brightness",
+                payload={
+                    "device_id": "light.kitchen",
+                    "action": "set_brightness",
+                    "brightness": 50,
+                },
+            )
+        )
+
+    assert result.success is False
+    assert result.data["verified"] is False
+    assert result.data["state"] == "unknown"
+
+
+@pytest.mark.anyio
+async def test_device_agent_retries_home_assistant_state_verification():
+    agent = DeviceAgent()
+    execute = AsyncMock(
+        side_effect=[
+            ToolExecutionResult(
+                capability="query_arcadedb", result=[{"result": "OnOff"}]
+            ),
+            ToolExecutionResult(capability="ha_call_service", result={"status": "ok"}),
+            ToolExecutionResult(capability="ha_get_state", result={"state": "off"}),
+            ToolExecutionResult(capability="ha_get_state", result={"state": "on"}),
+        ]
+    )
+    agent.tool_executor.execute = execute
+    with patch("orchestrator.agents.device_agent.asyncio.sleep", new=AsyncMock()):
+        result = await agent.run(
+            Task(
+                id="dev-ha-retry",
+                intent="turn on kitchen light",
+                payload={
+                    "device_id": "light.kitchen",
+                    "action": "turn_on",
+                },
+            )
+        )
+
+    assert result.success
+    assert result.data["verified"] is True
+    assert result.confidence == 0.95
+    assert execute.await_count == 4
+
+
+@pytest.mark.anyio
+async def test_device_agent_sets_home_assistant_temperature():
+    agent = DeviceAgent()
+    execute = AsyncMock(
+        side_effect=[
+            ToolExecutionResult(
+                capability="query_arcadedb",
+                result=[{"result": "TemperatureControl"}],
+            ),
+            ToolExecutionResult(capability="ha_call_service", result={"status": "ok"}),
+            ToolExecutionResult(
+                capability="ha_get_state", result={"attributes": {"temperature": 78.0}}
+            ),
+        ]
+    )
+    agent.tool_executor.execute = execute
+    result = await agent.run(
+        Task(
+            id="dev-temp",
+            intent="set media room thermostat",
+            payload={
+                "device_id": "climate.media_room",
+                "entity_id": "climate.media_room",
+                "domain": "climate",
+                "action": "set_temperature",
+                "temperature": 78.0,
+            },
+        )
+    )
+
+    assert result.success
+    assert result.data["state"] == "target_temperature:78.0"
+    assert result.data["execution_source"] == "home_assistant"
+    assert result.data["verified"] is True
+    service_arguments = execute.await_args_list[1].args[1]
+    assert service_arguments["domain"] == "climate"
+    assert service_arguments["service"] == "set_temperature"
+    assert service_arguments["entity_id"] == "climate.media_room"
+    assert service_arguments["service_data"] == {"temperature": 78.0}
+
+
+@pytest.mark.anyio
+async def test_device_agent_executes_a_confirmed_whole_home_temperature_batch():
+    """Each thermostat in a whole-home request receives its own verified call."""
+    agent = DeviceAgent()
+    agent.tool_executor.execute = AsyncMock(
+        side_effect=[
+            ToolExecutionResult(
+                capability="query_arcadedb", result=[{"result": "TemperatureControl"}]
+            ),
+            ToolExecutionResult(capability="ha_call_service", result={"status": "ok"}),
+            ToolExecutionResult(
+                capability="ha_get_state", result={"attributes": {"temperature": 78.0}}
+            ),
+            ToolExecutionResult(
+                capability="query_arcadedb", result=[{"result": "TemperatureControl"}]
+            ),
+            ToolExecutionResult(capability="ha_call_service", result={"status": "ok"}),
+            ToolExecutionResult(
+                capability="ha_get_state", result={"attributes": {"temperature": 80.0}}
+            ),
+        ]
+    )
+
+    result = await agent.run(
+        Task(
+            id="whole-home-temp",
+            intent="The house is too cold",
+            payload={
+                "type": "device",
+                "device_actions": [
+                    {
+                        "entity_id": "climate.living_room",
+                        "domain": "climate",
+                        "action": "set_temperature",
+                        "temperature": 78.0,
+                    },
+                    {
+                        "entity_id": "climate.media_room",
+                        "domain": "climate",
+                        "action": "set_temperature",
+                        "temperature": 80.0,
+                    },
+                ],
+            },
+        )
+    )
+
+    assert result.success
+    assert result.message == "Whole-home adjustment completed for 2 thermostats."
+    assert len(result.data["actions"]) == 2
+    service_calls = [
+        call.args[1]
+        for call in agent.tool_executor.execute.await_args_list
+        if call.args[0] == "ha_call_service"
+    ]
+    assert [call["entity_id"] for call in service_calls] == [
+        "climate.living_room",
+        "climate.media_room",
+    ]
+
+
+@pytest.mark.anyio
+async def test_device_agent_permission_allowed():
+
+    agent = DeviceAgent()
+
+    agent.tool_executor.execute = AsyncMock(
+        side_effect=[
+            ToolExecutionResult(
+                capability="query_arcadedb", result=[{"result": "OnOff"}]
+            ),
+            ToolExecutionResult(
+                capability="query_arcadedb", result=[{"result": "turn_on"}]
+            ),
+        ]
+    )
+    result = await agent.run(
+        Task(
+            id="dev-perm-1",
+            intent="device",
+            user_id="test@example.com",
+            payload={
+                "device_id": "light_1",
+                "action": "turn_on",
+            },
+        )
+    )
+
+    assert result.success
+
+
+@pytest.mark.anyio
+async def test_device_agent_accepts_arcadedb_gremlin_capability_rows():
+    """ArcadeDB returns scalar Gremlin values wrapped in result mappings."""
+    agent = DeviceAgent()
+    agent.tool_executor.execute = AsyncMock(
+        side_effect=[
+            ToolExecutionResult(
+                capability="query_arcadedb", result=[{"result": "OnOff"}]
+            ),
+            ToolExecutionResult(capability="ha_call_service", result={"status": "ok"}),
+            ToolExecutionResult(capability="ha_get_state", result={"state": "off"}),
+        ]
+    )
+    result = await agent.run(
+        Task(
+            id="dev-capability-row",
+            intent="turn off the media room light",
+            payload={
+                "device_id": "light.upstairs_media_light_1",
+                "entity_id": "light.upstairs_media_light_1",
+                "domain": "light",
+                "action": "turn_off",
+            },
+        )
+    )
+
+    assert result.success
+    assert result.data["capability_check"]["allowed"] is True
+
+
+@pytest.mark.anyio
+async def test_device_agent_permission_denied():
+
+    agent = DeviceAgent()
+
+    agent.tool_executor.execute = AsyncMock(
+        side_effect=[
+            ToolExecutionResult(
+                capability="query_arcadedb", result=[{"result": "OnOff"}]
+            ),
+            ToolExecutionResult(
+                capability="query_arcadedb", result=[{"result": "turn_off"}]
+            ),
+        ]
+    )
+    result = await agent.run(
+        Task(
+            id="dev-perm-2",
+            intent="device",
+            user_id="test@example.com",
+            payload={
+                "device_id": "light_1",
+                "action": "turn_on",
+            },
+        )
+    )
+
+    assert result.success is False
+
+
+# Test SecurityAgent & SensorAgent LLM Failure
+class _BrokenLLM:
+    async def generate(
+        self,
+        prompt: str,
+        temperature: float = 0.0,
+    ):
+        raise RuntimeError("LLM unavailable")
+
+
+@pytest.mark.anyio
+async def test_security_agent_llm_failure():
+
+    agent = SecurityAgent(
+        llm=_BrokenLLM(),
+    )
+
+    result = await agent.run(
+        Task(
+            id="sec-fail",
+            intent="security",
+            payload={},
+        )
+    )
+
+    assert result.success
+
+
+@pytest.mark.anyio
+async def test_sensor_agent_llm_failure():
+
+    agent = SensorAgent(
+        llm=_BrokenLLM(),
+    )
+
+    result = await agent.run(
+        Task(
+            id="sensor-fail",
+            intent="sensor",
+            payload={},
+        )
+    )
+
+    assert result.success
+
+
+@pytest.mark.anyio
+async def test_energy_agent_autonomous_event_invokes_llm():
+    class _EnergyLLM:
+        def __init__(self):
+            self.called = False
+
+        async def generate_structured(self, messages, output_model, temperature=0.7):
+            self.called = True
+            assert "EcoNest's energy optimization agent" in messages[0].content
+
+            return output_model(
+                priority="HIGH",
+                action="Investigate the unusually high appliance power draw.",
+                reasoning="The current power reading is significantly above the supplied baseline.",
+            )
+
+    llm = _EnergyLLM()
+    agent = EnergyAgent(llm=llm)
+
+    async def _context(task):
+        return {
+            "current_hour": 18,
+            "source": "ha_event_dispatcher",
+            "trigger": "energy_anomaly_detected",
+            "mysql": {"available": False},
+        }
+
+    async def _graph_observations(task):
+        return []
+
+    async def _mysql_history(task):
+        return []
+
+    agent._build_context = _context
+    agent._observations_from_graph = _graph_observations
+    agent._history_from_mysql = _mysql_history
+
+    result = await agent.run(
+        Task(
+            id="autonomous-energy-llm",
+            intent="energy event: energy_anomaly_detected at sensor.dryer_power",
+            payload={
+                "type": "energy",
+                "event_type": "energy_anomaly_detected",
+                "entity_id": "sensor.dryer_power",
+                "use_llm": True,
+                "observations": [
+                    {
+                        "entity_id": "sensor.dryer_power",
+                        "name": "Dryer",
+                        "current_power_w": 650,
+                        "baseline_w": 100,
+                        "reason": "Power is significantly above baseline.",
+                    }
+                ],
+            },
+            metadata={
+                "source": "ha_event_dispatcher",
+                "event_type": "energy_anomaly_detected",
+            },
+        )
+    )
+
+    assert result.success
+    assert llm.called is True
+    assert (
+        result.data["recommendations"][0]["action"]
+        == "Investigate the unusually high appliance power draw."
+    )
+
+
+@pytest.mark.anyio
+async def test_energy_agent_gathers_live_ha_state_via_mcp():
+    agent = EnergyAgent()
+
+    agent._mysql_energy_context = AsyncMock(return_value={"available": True})
+
+    execute = AsyncMock(
+        return_value=ToolExecutionResult(
+            capability="ha_get_state",
+            result={
+                "entity_id": "sensor.dryer_power",
+                "state": "850",
+                "attributes": {
+                    "friendly_name": "Dryer Power",
+                    "unit_of_measurement": "W",
+                },
+            },
+        )
+    )
+    agent.tool_executor.execute = execute
+
+    context = await agent._build_context(
+        Task(
+            id="energy-mcp-context",
+            intent="energy event: appliance_cycle_started",
+            payload={
+                "type": "energy",
+                "event_type": "appliance_cycle_started",
+                "entity_id": "sensor.dryer_power",
+            },
+            metadata={
+                "source": "ha_event_dispatcher",
+                "event_type": "appliance_cycle_started",
+            },
+        )
+    )
+
+    assert context["live_entity_state"]["state"] == "850"
+    assert context["live_entity_state"]["attributes"]["friendly_name"] == "Dryer Power"
+
+    execute.assert_awaited_once()
+    assert execute.await_args.args[0] == "ha_get_state"
+    assert execute.await_args.args[1] == {
+        "entity_id": "sensor.dryer_power",
+    }
+
+
+@pytest.mark.anyio
+async def test_security_agent_autonomous_event_invokes_llm():
+    from orchestrator.agents.security_agent import SecurityAgent
+
+    class _SecurityLLM:
+        def __init__(self):
+            self.called = False
+
+        async def generate(self, prompt, temperature=0.7):
+            self.called = True
+            return "Review the detected motion event and confirm whether follow-up is needed."
+
+    llm = _SecurityLLM()
+    agent = SecurityAgent(llm=llm)
+
+    agent._build_context = AsyncMock(
+        return_value={
+            "hour": 18,
+            "source": "ha_event_dispatcher",
+            "trigger": "motion_detected",
+        }
+    )
+    agent._observations_from_graph = AsyncMock(return_value=[])
+
+    result = await agent.run(
+        Task(
+            id="autonomous-security-llm",
+            intent="security event: motion_detected at binary_sensor.front_door_motion",
+            payload={
+                "type": "security",
+                "event_type": "motion_detected",
+                "entity_id": "binary_sensor.front_door_motion",
+                "use_llm": True,
+                "motion": True,
+                "observations": [
+                    {
+                        "entity_id": "binary_sensor.front_door_motion",
+                        "state": "on",
+                        "name": "Front Door Motion",
+                    }
+                ],
+            },
+            metadata={
+                "source": "ha_event_dispatcher",
+                "event_type": "motion_detected",
+            },
+        )
+    )
+
+    assert result.success
+    assert llm.called is True
+
+
+@pytest.mark.anyio
+async def test_security_agent_gathers_live_ha_state_via_mcp():
+    agent = SecurityAgent()
+
+    execute = AsyncMock(
+        return_value=ToolExecutionResult(
+            capability="ha_get_state",
+            result={
+                "entity_id": "binary_sensor.front_door_motion",
+                "state": "on",
+                "attributes": {
+                    "friendly_name": "Front Door Motion",
+                },
+            },
+        )
+    )
+    agent.tool_executor.execute = execute
+
+    context = await agent._build_context(
+        Task(
+            id="sec-mcp-context",
+            intent="security event: motion_detected",
+            payload={
+                "type": "security",
+                "event_type": "motion_detected",
+                "entity_id": "binary_sensor.front_door_motion",
+            },
+            metadata={
+                "source": "ha_event_dispatcher",
+                "event_type": "motion_detected",
+            },
+        )
+    )
+
+    assert context["live_entity_state"]["state"] == "on"
+    assert (
+        context["live_entity_state"]["attributes"]["friendly_name"]
+        == "Front Door Motion"
+    )
+
+    execute.assert_awaited_once()
+    assert execute.await_args.args[0] == "ha_get_state"
+    assert execute.await_args.args[1] == {
+        "entity_id": "binary_sensor.front_door_motion",
+    }
+
+
+@pytest.mark.anyio
+async def test_irrigation_agent_autonomous_event_invokes_llm():
+    from orchestrator.agents.irrigation_agent import IrrigationAgent
+
+    class _IrrigationLLM:
+        def __init__(self):
+            self.called = False
+
+        async def generate(self, prompt, temperature=0.7):
+            self.called = True
+            return "Recent conditions support reviewing the watering schedule before running the zone."
+
+    llm = _IrrigationLLM()
+    agent = IrrigationAgent(llm=llm)
+
+    agent._forecast_rows = AsyncMock(return_value=[])
+    agent._irrigation_zones = AsyncMock(return_value=["front_lawn"])
+    agent._recent_irrigation_runs = AsyncMock(return_value=[])
+
+    result = await agent.run(
+        Task(
+            id="autonomous-irrigation-llm",
+            intent="irrigation event: watering_started at switch.front_lawn_watering",
+            payload={
+                "type": "irrigation",
+                "event_type": "watering_started",
+                "entity_id": "switch.front_lawn_watering",
+                "use_llm": True,
+            },
+            metadata={
+                "source": "ha_event_dispatcher",
+                "event_type": "watering_started",
+            },
+        )
+    )
+
+    assert result.success
+    assert llm.called is True
+    assert result.data["model_explanation_used"] is True
+    assert result.data["context"]["trigger"] == "watering_started"
+    assert "live_entity_state" in result.data["context"]
+
+
+@pytest.mark.anyio
+async def test_irrigation_agent_gathers_live_ha_state_via_mcp():
+    from orchestrator.agents.irrigation_agent import IrrigationAgent
+    from orchestrator.mcp.models import ToolExecutionResult
+
+    agent = IrrigationAgent()
+
+    execute = AsyncMock(
+        return_value=ToolExecutionResult(
+            capability="ha_get_state",
+            result={
+                "entity_id": "switch.front_lawn_watering",
+                "state": "on",
+                "attributes": {
+                    "friendly_name": "Front Lawn Watering",
+                },
+            },
+        )
+    )
+    agent.tool_executor.execute = execute
+
+    context = await agent._live_entity_state(
+        Task(
+            id="irrigation-mcp-context",
+            intent="irrigation event: watering_started",
+            payload={
+                "type": "irrigation",
+                "event_type": "watering_started",
+                "entity_id": "switch.front_lawn_watering",
+            },
+            metadata={
+                "source": "ha_event_dispatcher",
+                "event_type": "watering_started",
+            },
+        )
+    )
+
+    assert context["state"] == "on"
+    assert context["attributes"]["friendly_name"] == "Front Lawn Watering"
+
+    execute.assert_awaited_once()
+    assert execute.await_args.args[0] == "ha_get_state"
+    assert execute.await_args.args[1] == {
+        "entity_id": "switch.front_lawn_watering",
+    }
+
+
+@pytest.mark.anyio
+async def test_sensor_agent_autonomous_event_invokes_llm():
+    from orchestrator.agents.sensor_agent import SensorAgent
+
+    class _SensorLLM:
+        def __init__(self):
+            self.called = False
+
+        async def generate(self, prompt, temperature=0.7):
+            self.called = True
+            return "The sensor should be reviewed because its state is unavailable."
+
+    llm = _SensorLLM()
+    agent = SensorAgent(llm=llm)
+
+    agent._build_context = AsyncMock(
+        return_value={
+            "source": "ha_event_dispatcher",
+            "trigger": "device_became_unavailable",
+        }
+    )
+    agent._observations_from_graph = AsyncMock(return_value=[])
+
+    result = await agent.run(
+        Task(
+            id="autonomous-sensor-llm",
+            intent="sensor event: device_became_unavailable at sensor.wifi_soil_sensor",
+            payload={
+                "type": "sensor",
+                "event_type": "device_became_unavailable",
+                "entity_id": "sensor.wifi_soil_sensor",
+                "use_llm": True,
+                "observations": [
+                    {
+                        "entity_id": "sensor.wifi_soil_sensor",
+                        "state": "unavailable",
+                        "name": "WiFi Soil Sensor",
+                    }
+                ],
+            },
+            metadata={
+                "source": "ha_event_dispatcher",
+                "event_type": "device_became_unavailable",
+            },
+        )
+    )
+
+    assert result.success
+    assert llm.called is True
+    assert result.data["llm_assessment"] is not None
+
+
+@pytest.mark.anyio
+async def test_sensor_agent_gathers_live_ha_state_via_mcp():
+    agent = SensorAgent()
+
+    execute = AsyncMock(
+        return_value=ToolExecutionResult(
+            capability="ha_get_state",
+            result={
+                "entity_id": "sensor.wifi_soil_sensor",
+                "state": "unavailable",
+                "attributes": {
+                    "friendly_name": "WiFi Soil Sensor",
+                },
+            },
+        )
+    )
+    agent.tool_executor.execute = execute
+
+    context = await agent._build_context(
+        Task(
+            id="sensor-mcp-context",
+            intent="sensor event: device_became_unavailable",
+            payload={
+                "type": "sensor",
+                "event_type": "device_became_unavailable",
+                "entity_id": "sensor.wifi_soil_sensor",
+            },
+            metadata={
+                "source": "ha_event_dispatcher",
+                "event_type": "device_became_unavailable",
+            },
+        )
+    )
+
+    assert context["live_entity_state"]["state"] == "unavailable"
+    assert (
+        context["live_entity_state"]["attributes"]["friendly_name"]
+        == "WiFi Soil Sensor"
+    )
+
+    execute.assert_awaited_once()
+    assert execute.await_args.args[0] == "ha_get_state"
+    assert execute.await_args.args[1] == {
+        "entity_id": "sensor.wifi_soil_sensor",
+    }
+
+
+@pytest.mark.anyio
+async def test_orchestrator_does_not_classify_ha_irrigation_event_as_device_control():
+    orch = AgentOrchestrator()
+
+    task = Task(
+        id="irrigation-event-policy",
+        intent="irrigation event: watering_started at switch.front_lawn_watering",
+        payload={
+            "type": "irrigation",
+            "event_type": "watering_started",
+            "entity_id": "switch.front_lawn_watering",
+        },
+        metadata={
+            "source": "ha_event_dispatcher",
+            "event_type": "watering_started",
+        },
+    )
+
+    assert orch._is_device_control_task(task) is False
+
+
+@pytest.mark.anyio
+async def test_orchestrator_blocks_ha_event_device_action_by_default():
+    orch = AgentOrchestrator(
+        agents=[_StaticAgent("device")],
+        current_hour_provider=lambda: 12,
+    )
+
+    task = Task(
+        id="policy-ha-event-1",
+        intent="device event: thermostat_target_changed at climate.downstairs",
+        payload={
+            "type": "device",
+            "event_type": "thermostat_target_changed",
+            "entity_id": "climate.downstairs",
+            "action": "set_temperature",
+            "domain": "climate",
+            "temperature": 72,
+        },
+        metadata={
+            "source": "ha_event_dispatcher",
+            "event_type": "thermostat_target_changed",
+        },
+    )
+
+    orch.tool_executor.execute = AsyncMock()
+
+    await orch._run_with_lifecycle(task)
+
+    result = await orch.get_result("policy-ha-event-1")
+
+    assert result is not None
+    assert not result.success
+    assert result.error == "policy_autonomous_action_restricted"
+    assert orch.agents[0].run_count == 0

@@ -1,0 +1,298 @@
+"""Tests for the human-readable autonomy activity feed."""
+
+from datetime import datetime
+
+from orchestrator.api.autonomy import (
+    _action_activity_view,
+    _active_task_view,
+    _deduplicate_action_activity,
+    _recommendation_view,
+    _recommendation_views,
+    scheduled_recommendation_kind,
+)
+
+
+def test_action_activity_maps_live_and_retained_work_to_lifecycle_states() -> None:
+    """The dashboard exposes status, rationale, and progress for each action."""
+    active = _active_task_view(
+        {"task_id": "task-1", "intent": "Review household energy use."}
+    )
+    pending = _action_activity_view(
+        {
+            "reason": "Power usage changed.",
+            "outcome": {"state": "pending", "label": "Awaiting execution result"},
+        }
+    )
+    completed = _action_activity_view(
+        {
+            "reason": "The review found no safety issue.",
+            "outcome": {"state": "advisory", "label": "Recommendation only"},
+        }
+    )
+    failed = _action_activity_view(
+        {
+            "reason": "The device did not respond.",
+            "outcome": {"state": "failed", "label": "Failed — device action error"},
+        }
+    )
+
+    assert active["status"] == "active"
+    assert active["rationale"] == "Review household energy use."
+    assert pending["status"] == "pending"
+    assert completed["status"] == "completed"
+    assert failed["status"] == "failed"
+    assert failed["execution_progress"]["label"] == "Failed — device action error"
+
+
+def test_action_activity_shows_one_latest_dryer_monitoring_advisory() -> None:
+    """Recurring dryer monitoring advice is one current board item, not many actions."""
+    actions = [
+        {
+            "status": "completed",
+            "category": "Energy",
+            "action": "Monitor the dryer's energy consumption.",
+            "rationale": "It is currently drawing 1803.3 W.",
+            "execution_progress": {"label": "Recommendation only"},
+        },
+        {
+            "status": "completed",
+            "category": "Energy",
+            "action": "Monitor the dryer's energy consumption closely.",
+            "rationale": "It has just started a cycle.",
+            "execution_progress": {"label": "Recommendation only"},
+        },
+        {
+            "status": "completed",
+            "category": "Energy",
+            "action": "Review the refrigerator's power use.",
+            "rationale": "The refrigerator is using its normal load.",
+            "execution_progress": {"label": "Recommendation only"},
+        },
+        {
+            "status": "pending",
+            "category": "Energy",
+            "action": "Monitor the dryer's energy consumption.",
+            "rationale": "A review is running.",
+            "execution_progress": {"label": "Awaiting result"},
+        },
+        {
+            "status": "completed",
+            "category": "Energy",
+            "action": "Investigate the Balance Power Minute Average sensor.",
+            "rationale": "The current reading is high.",
+            "execution_progress": {"label": "Recommendation only"},
+        },
+        {
+            "status": "completed",
+            "category": "Energy",
+            "action": "Monitor the Balance Power Minute Average sensor.",
+            "rationale": "Its deviation needs attention.",
+            "execution_progress": {"label": "Recommendation only"},
+        },
+        {
+            "status": "completed",
+            "category": "Watering",
+            "action": "Skip scheduled watering",
+            "rationale": "Rain is expected.",
+            "execution_progress": {"label": "Recommendation only"},
+        },
+        {
+            "status": "completed",
+            "category": "Watering",
+            "action": "Skip scheduled watering",
+            "rationale": "The schedule does not need to run.",
+            "execution_progress": {"label": "Recommendation only"},
+        },
+    ]
+
+    visible = _deduplicate_action_activity(actions)
+
+    assert [item["action"] for item in visible] == [
+        "Monitor the dryer's energy consumption.",
+        "Review the refrigerator's power use.",
+        "Monitor the dryer's energy consumption.",
+        "Investigate the Balance Power Minute Average sensor.",
+        "Skip scheduled watering",
+    ]
+
+
+def test_recommendation_view_preserves_human_decision_context() -> None:
+    """Expose the timestamp, reason, confidence, and target from audit data."""
+    view = _recommendation_view(
+        {
+            "timestamp": "2026-08-26T19:00:00+00:00",
+            "event_type": "autonomy.action.recommended",
+            "recommendation": {
+                "action": "turn_off",
+                "entity_id": "light.upstairs_media_light_1",
+                "confidence": 0.9,
+                "reason": "No active motion is present.",
+                "risk_level": "LOW",
+                "source": "fallback_policy",
+                "fallback_reason": "Ollama returned an invalid structured response.",
+            },
+        }
+    )
+
+    assert view["timestamp"] == "2026-08-26T19:00:00+00:00"
+    assert view["confidence"] == 0.9
+    assert view["reason"] == "No active motion is present."
+    assert view["entity_id"] == "light.upstairs_media_light_1"
+    assert view["fallback_reason"] == "Ollama returned an invalid structured response."
+
+
+def test_recommendation_view_includes_successful_execution() -> None:
+    """Show a completed Home Assistant action next to its recommendation."""
+    views = _recommendation_views(
+        [
+            {
+                "timestamp": "2026-08-26T19:00:00+00:00",
+                "event_type": "autonomy.action.recommended",
+                "recommendation": {
+                    "action": "turn_off",
+                    "entity_id": "light.upstairs_media_light_1",
+                },
+            },
+            {
+                "event_type": "autonomy.action.executed",
+                "success": True,
+                "recommendation": {
+                    "action": "turn_off",
+                    "entity_id": "light.upstairs_media_light_1",
+                },
+                "result": {"success": True},
+            },
+        ]
+    )
+
+    assert views[0]["outcome"]["state"] == "success"
+    assert views[0]["outcome"]["label"] == "Executed successfully"
+
+
+def test_recommendation_view_explains_access_failure() -> None:
+    """Distinguish permission failures from ordinary device errors."""
+    views = _recommendation_views(
+        [
+            {
+                "event_type": "autonomy.action.recommended",
+                "recommendation": {
+                    "action": "turn_on",
+                    "entity_id": "light.upstairs_media_light_1",
+                },
+            },
+            {
+                "event_type": "autonomy.action.executed",
+                "success": False,
+                "recommendation": {
+                    "action": "turn_on",
+                    "entity_id": "light.upstairs_media_light_1",
+                },
+                "result": {"error": "Home Assistant returned 403 Forbidden"},
+            },
+        ]
+    )
+
+    assert views[0]["outcome"]["state"] == "failed"
+    assert views[0]["outcome"]["label"] == "Failed — Home Assistant access limitation"
+
+
+def test_energy_recommendations_are_shown_as_timestamped_advisory_cards() -> None:
+    """Show every stored, on-demand energy recommendation without an action outcome."""
+    views = _recommendation_views(
+        [
+            {
+                "timestamp": "2026-08-27T16:00:00+00:00",
+                "event_type": "energy.recommendations.generated",
+                "source": "http_api",
+                "recommendation_only": True,
+                "recommendations": [
+                    {
+                        "priority": "MEDIUM",
+                        "action": "Schedule flexible loads for 11pm–12am",
+                        "reasoning": "The tariff forecast is highest now.",
+                    }
+                ],
+            }
+        ]
+    )
+
+    assert len(views) == 1
+    assert views[0]["timestamp"] == "2026-08-27T16:00:00+00:00"
+    assert views[0]["risk_level"] == "MEDIUM"
+    assert views[0]["outcome"]["state"] == "advisory"
+    assert views[0]["outcome"]["detail"] == "EcoNest did not control any device."
+
+
+def test_recommendation_view_preserves_event_trigger_and_state_details() -> None:
+    """Expose retained event evidence for the collapsed UI technical details."""
+    views = _recommendation_views(
+        [
+            {
+                "timestamp": "2026-10-07T20:00:00+00:00",
+                "event_type": "energy.recommendations.generated",
+                "source": "ha_event_dispatcher",
+                "technical_details": {
+                    "trigger_source": "ha_event_dispatcher",
+                    "trigger_type": "energy_anomaly_detected",
+                    "entity_id": "sensor.dryer_power",
+                    "state_before": "80",
+                    "state_after_event": "900",
+                    "live_state": {"available": True, "state": "900"},
+                    "review_completed": True,
+                },
+                "recommendations": [
+                    {
+                        "priority": "HIGH",
+                        "action": "Review dryer power",
+                        "reasoning": "Power rose sharply.",
+                    }
+                ],
+            }
+        ]
+    )
+
+    assert views[0]["technical_details"]["trigger_type"] == "energy_anomaly_detected"
+    assert views[0]["technical_details"]["state_before"] == "80"
+    assert views[0]["technical_details"]["state_after_event"] == "900"
+
+
+def test_recommendation_schedule_rotates_in_ten_minute_slots() -> None:
+    """Energy, security, and watering repeat in a thirty-minute cycle."""
+    assert scheduled_recommendation_kind(datetime(2026, 9, 24, 9, 0)) == "energy"
+    assert scheduled_recommendation_kind(datetime(2026, 9, 24, 9, 10)) == "security"
+    assert scheduled_recommendation_kind(datetime(2026, 9, 24, 9, 20)) == "irrigation"
+    assert scheduled_recommendation_kind(datetime(2026, 9, 24, 9, 30)) == "energy"
+
+
+def test_security_and_watering_reviews_are_shown_as_advisory_cards() -> None:
+    """Show the two new scheduled recommendation categories in the shared feed."""
+    views = _recommendation_views(
+        [
+            {
+                "timestamp": "2026-09-24T14:10:00+00:00",
+                "event_type": "security.recommendations.generated",
+                "recommendations": [
+                    {
+                        "priority": "LOW",
+                        "action": "Continue monitoring",
+                        "reasoning": "No anomaly.",
+                    }
+                ],
+            },
+            {
+                "timestamp": "2026-09-24T14:20:00+00:00",
+                "event_type": "irrigation.recommendations.generated",
+                "recommendations": [
+                    {
+                        "priority": "LOW",
+                        "action": "Skip scheduled watering",
+                        "reasoning": "Rain forecast.",
+                    }
+                ],
+            },
+        ]
+    )
+
+    assert [view["category"] for view in views] == ["Security", "Watering"]
+    assert views[0]["entity_id"] == "Home security"
+    assert views[1]["entity_id"] == "Irrigation and weather"

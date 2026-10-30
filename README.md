@@ -1,0 +1,591 @@
+# EcoNest
+
+EcoNest is an AI-assisted smart-home system. It connects to Home Assistant,
+understands user requests, reviews energy and security signals, and makes
+carefully constrained device-control recommendations.
+
+The model can recommend or propose an action, but it cannot bypass EcoNest's
+safety checks. Every device action goes through MCP, live Home Assistant
+validation, state verification, and an audit record.
+
+## How to use
+
+Use EcoNest in two ways:
+
+- **User action:** Type a request or use **Use voice input** in the Command
+  Center, review the editable transcript and EcoNest's interpretation, and
+  confirm it before a device changes. Voice recording works in Firefox and
+  other modern browsers: EcoNest transcribes the temporary recording locally
+  with the free Whisper `tiny.en` model. Audio is deleted immediately after
+  transcription, and voice input only fills the text box—it never submits or
+  controls a device by itself. Set `LOCAL_STT_ENABLED=true` to enable it; the
+  model downloads once into the local Docker `whisper-models` volume.
+- **Autonomous recommendation:** The scheduled monitor reviews home state and
+  records recommendations. It can execute only explicitly allowed low-risk
+  actions after every safety check passes.
+
+Examples:
+
+```text
+Turn off the media room light
+How can I reduce my home's energy use?
+Give me a security assessment
+```
+
+Device commands require confirmation. Energy and security reviews are advisory
+and do not control devices.
+
+## Open EcoNest
+
+Open the **EcoNest Launchpad** at the root of the EcoNest Orchestrator. It is
+the single entry point for every dashboard, integration, and developer tool.
+The external Home Assistant and ArcadeDB buttons automatically use the same
+host as the Launchpad.
+
+**Launchpad:** `http://<MAC_MINI_IP>:8001/launchpad`
+
+| Launchpad button | What it opens |
+| --- | --- |
+| User prompts | Natural-language device commands and advisory energy or security reviews. |
+| Autonomous actions | Scheduled energy, security, and watering recommendations with recorded outcomes. |
+| Insights | Learned energy, comfort, irrigation, and electricity-cost analytics. |
+| MCP activity | The audited MCP calls behind EcoNest tasks, including tool, agent, timing, and result. |
+| MySQL Explorer | Read-only operational records and retained sensor data. |
+| MySQL relationship map | Visual guide to the live MySQL tables and their relationships. |
+| Home Assistant | The live smart-home dashboard and final authority for device states and service calls. |
+| ArcadeDB | The room, device, sensor, capability, and relationship graph. |
+| Google Calendar | Read-only household-calendar context and connection status. |
+| Orchestrator API | Interactive API documentation for integration and troubleshooting. |
+| System health | Current MySQL and ArcadeDB health status. |
+
+## How it works
+
+![EcoNest workflow: trigger, orchestration, specialist agent, MCP data, read-only answer or safety-gated device action, and audit record](docs/econest-workflow.svg)
+
+| Part | Role |
+| --- | --- |
+| Home Assistant | Connects to physical devices, supplies live state, and performs approved service calls. |
+| Orchestrator | Receives requests, selects agents, applies policy, and records outcomes. |
+| Gemma 3 (4B) through Ollama | Local model for request interpretation, recommendations, and explanations. |
+| MCP | Controlled, auditable bridge that agents use to read context or take approved actions. |
+| MySQL | Structured data store for rooms, devices, readings, users, sessions, and audit history. |
+| ArcadeDB | Relationship graph for rooms, devices, sensors, capabilities, and context. |
+
+### Agents
+
+- **Energy Agent:** Produces advisory energy analysis and recommendations.
+- **Security Agent:** Assesses security signals such as motion, sound,
+  occupancy, and unusual events.
+- **Sensor Agent:** Diagnoses sensor readings and health.
+- **Device Agent:** Validates a device capability and action, calls Home
+  Assistant through MCP, and verifies the resulting state.
+
+### Graph layer and execution boundary
+
+EcoNest separates understanding the home from changing the home:
+
+```text
+Home Assistant + MySQL + approved connectors
+                    ↓
+        ArcadeDB household knowledge graph
+                    ↓
+       Gemma and specialist-agent reasoning
+                    ↓
+          deterministic policy / safety gate
+                    ↓
+ Device Agent execution boundary → Home Assistant verification → audit record
+```
+
+**ArcadeDB is EcoNest's household knowledge graph, not a device controller.**
+It represents relationships such as which devices and sensors belong to a room,
+which capabilities a device has, and which observations provide context for a
+decision. It helps agents ground their reasoning, but it is not the source of
+truth for live state.
+
+Before a Gemma-backed specialist review, EcoNest builds a bounded household
+context package. It resolves the relevant entity IDs, device names, and room
+names from the request against the current graph, then supplies only the
+matched devices, rooms, related sensors, capabilities, Calendar context, and
+compact live Home Assistant facts. This works across the current graph
+inventory; it is not a room-specific rule or a hard-coded device list.
+
+The graph/brain implementation is the reusable context wrapper. It provides a
+standard `build_context()` operation for one task and a non-sensitive
+`status()` operation for diagnostics. Its MCP resources are
+`home://household-context` and `home://household-context/status`. Calendar,
+weather, and Gmail connectors now feed the same bounded-context pattern.
+
+**The Device Agent is the execution boundary.** It can request a Home
+Assistant service call only after the orchestrator has applied capability,
+permission, allowlist, current-state, and confirmation checks where required.
+Gemma, connector data, and graph results can recommend or explain an action;
+none can execute it directly. Home Assistant remains the authority for the
+device state, and EcoNest records the verified result in its audit trail.
+
+See [Architecture and data flow](docs/architecture-and-dataflow.md) for the
+full data-flow and source-of-truth boundaries.
+
+## External connectors and household context
+
+The **User prompts** page is the primary at-a-glance workspace: the prompt
+composer remains at the top, and its collapsible **Home at a glance** section
+shows the live Home Assistant snapshot immediately below it. It separates
+Home Assistant `person` entities from tracked devices such as phones or
+tablets, while using both as presence evidence. The standalone snapshot route
+remains available as an API/UI endpoint, but is not a separate Launchpad
+navigation item.
+
+Connectors let EcoNest use approved external information without giving an
+external provider direct control over the home. Each connector follows the
+same high-level boundary:
+
+```text
+External provider → connector wrapper → bounded EcoNest context → agents/policy
+```
+
+The connector wrapper is responsible for authentication, read-only retrieval,
+provider-specific parsing, privacy filtering, synchronization status, and audit
+metadata. Agents receive the bounded context rather than credentials or raw
+provider data. Context can influence an explanation or recommendation; it
+never authorizes a device action by itself.
+
+The **Household context** page includes a visual flow of this boundary:
+sources → context wrapper → graph/brain → Gemma, policy, and the MCP/Home
+Assistant execution boundary. It is intended to make the wrapper's role clear
+without suggesting that connector data can directly control a device.
+
+| Connector | Status | What EcoNest uses | What reaches agents | Device authority |
+| --- | --- | --- | --- | --- |
+| Home Assistant | Available | Live devices, sensor readings, and significant home events. | Live device/sensor facts through MCP. | Only after capability, policy, confirmation (when required), state verification, and audit checks. |
+| Google Calendar | Available, optional | Read-only events from one connected household calendar. | Derived `away` or `hosting` time windows and policy guidance. | None. Active context can queue advisory energy and security reviews only. |
+| Weather | Available through Home Assistant weather data | Forecast, precipitation, and outdoor conditions. | Bounded forecast facts used by irrigation and energy recommendations. | None by itself. |
+| Gmail | Available, opt-in | Metadata from explicitly allowed sender domains and Gmail labels; an explicit test-only mode may inspect plain-text bodies transiently. | A short-lived `travel` or `utility` category, derived time window, and policy guidance—not raw email bodies, sender addresses, or subject text. | None. Cannot bypass policy, confirmation, or safety checks. |
+
+### What exists today
+
+- **Home Assistant** is EcoNest's live source of truth for devices and sensor
+  state. It is also the only connector that can carry out an approved device
+  service call.
+- **Google Calendar** uses read-only OAuth access. Event titles are shown only
+  on demand in the Calendar page and are neither retained nor sent to Gemma.
+  EcoNest stores only a non-identifying event hash, a derived `away` or
+  `hosting` window, and bounded guidance.
+- **Weather** is collected through the Home Assistant weather capability and
+  informs read-only watering and energy recommendations. Watering results use
+  evidence labels such as `Rain expected`, `Recently watered — verify before
+  running`, and `Schedule may be due — verify before running`; these describe
+  the available forecast and run history rather than claiming a soil-moisture
+  reading EcoNest does not have.
+- **Gmail** is an optional connector. Synchronization is blocked until a
+  sender-domain allowlist is configured. Its default `gmail.metadata` scope
+  reduces transient headers to an allowlisted category. An explicit local
+  test mode uses read-only access to inspect a bounded plain-text body and
+  derive dates, but still persists and prompts only the resulting category,
+  time window, and guidance—not raw email text.
+- The **User prompts** and **Autonomous actions** pages combine upcoming
+  Calendar events with scheduled Gmail-derived context. Gmail entries are
+  visibly labeled and expose only their generated category and time window.
+- The **Household context** page includes a refreshable **Household plan**.
+  It combines an upcoming `away` or `hosting` window with current weather and
+  the live Home Assistant snapshot. Gemma proposes practical settings,
+  expected household activity, and conditions to watch; EcoNest uses a local
+  trip/hosting plan if Gemma is unavailable. The card describes a target home
+  state and does not change devices.
+- When an `away` or `hosting` Calendar window becomes active, EcoNest can
+  synchronize it on a short interval and queue one advisory Energy review and
+  one advisory Security review for that event. Those reviews are visible in
+  **Autonomous actions**, are recorded as `calendar_context`, and do not call
+  Home Assistant to change a device.
+
+### Planned connector work
+
+1. Add a connector status view with last synchronization time, scoped access,
+   and error state for every provider.
+2. Add user-controlled context rules, for example which calendars or weather
+   signals may inform recommendations.
+3. Add user-managed connector rules in the UI (rather than deployment
+   configuration) for Gmail sender domains and labels.
+4. Keep the same safety boundary for every new connector: it may supply
+   evidence, but it cannot bypass policy, confirmation, or safety checks.
+
+## Gemma prompts and when they run
+
+EcoNest uses the local **Gemma 3 4B** model through Ollama for bounded
+interpretation, routing, and explanations. The prompts below show the actual
+instructions sent to the model; values in angle brackets are filled with the
+current task data. Secrets, Home Assistant tokens, passwords, and raw audit
+records are never included.
+
+Structured prompts also include a system instruction generated from the
+relevant Pydantic response schema: `Respond with valid JSON matching this
+schema. Output ONLY JSON.` This lets EcoNest validate the model's answer before
+using it.
+
+### Manual Command Center interpretation
+
+**Trigger:** A signed-in user enters a request in **User actions** and selects
+**Understand command**. EcoNest first reads the live device inventory through
+MCP, selects the most relevant entries, and sends this prompt. It only
+interprets the request; no device action happens until the user confirms.
+
+```text
+Interpret this smart-home request. First choose request_kind:
+energy_recommendation when the user asks about energy use, efficiency, power,
+cost, or savings; security_recommendation when they ask for a security
+assessment, safety advice, or suspicious activity review; and device_control
+only when they request a concrete device action. Energy and security
+recommendation requests are advisory: return their request_kind with null
+entity_id and action.
+
+For device_control, select an entity_id and action ONLY from the supplied
+device inventory. Do not invent an entity, action, or value. Never ask the user
+for an entity ID or other technical identifier. Treat singular and plural
+device wording as equivalent. When one device is the clear name-and-room match,
+select it even if the wording is not identical to its friendly name. If a
+device command is ambiguous, lacks a required value, or does not match one
+listed device, return null for entity_id and action and write a short
+clarification question. set_brightness requires brightness (0-100);
+set_temperature requires temperature. This only prepares a confirmation; it
+does not control a device.
+
+User command: <user text>
+Device inventory: <matching live Home Assistant entities and allowed actions>
+```
+
+### Agent routing after a confirmed request
+
+**Trigger:** A user confirms a Command Center interpretation, or EcoNest
+submits an internal task. This small routing prompt selects one specialist
+agent; it does not decide whether a device is allowed to change.
+
+```text
+Classify this smart-home task into exactly one category: energy, security,
+sensor, device, multi, or unknown.
+
+Use the payload as the strongest signal. If the payload asks for a concrete
+device action such as turn_on, turn_off, set_brightness, open, close, or
+includes a controllable domain like light or switch, classify it as device even
+if the text also mentions motion or security.
+
+Intent: <task intent>
+Payload: <approved task fields>
+Metadata: <source and role metadata>
+```
+
+If Gemma is unavailable or returns low confidence, EcoNest uses deterministic
+routing rules. This fallback routes work; it never authorizes an unsafe action.
+
+### Energy recommendation prompt
+
+**Trigger:** An energy review submitted from the Autonomy page with **Request
+energy review**, when the review has a measured anomaly, schedule violation, or
+tariff forecast. It is recommendation-only. A Command Center energy request
+currently uses the same Energy Agent but remains deterministic unless its task
+explicitly enables LLM analysis.
+
+Template: [`orchestrator/llm/prompts/energy.j2`](orchestrator/llm/prompts/energy.j2)
+
+```text
+You are EcoNest's energy optimization agent.
+
+Intent: <energy-review request>
+Pricing snapshot: <measured tariff context, or "unknown">
+Detected anomalies: <measured energy anomalies>
+Schedule violations: <detected schedule conflicts>
+Current deterministic recommendations: <evidence-based candidates>
+
+Return one concise, recommendation-only suggestion for reducing waste or using
+a lower-price period only when the supplied pricing snapshot establishes one.
+Ground every claim in the supplied snapshots and deterministic recommendations.
+If pricing is unknown, do not mention a cheap, peak, off-peak, or lower-price
+window. Never issue a device command, claim a fixed peak schedule, or imply
+that EcoNest will switch a device on or off.
+```
+
+### Security and sensor assessment prompts
+
+**Trigger:** A Security Agent or Sensor Agent task with `use_llm=true`.
+These are analysis-only prompts and are not used to control a device. The
+current Command Center security-review path is deterministic unless a caller
+explicitly enables this LLM assessment.
+
+Security template: [`orchestrator/llm/prompts/security.j2`](orchestrator/llm/prompts/security.j2)
+
+```text
+You are EcoNest SecurityAgent.
+Context: <task context>
+Recent observations: <security observations>
+Detected anomalies: <security incidents>
+Current severity: <LOW, MEDIUM, or HIGH>
+
+Provide:
+1. Security assessment
+2. Likely explanation
+3. Recommended action
+
+Be concise.
+```
+
+Sensor template: [`orchestrator/llm/prompts/sensor.j2`](orchestrator/llm/prompts/sensor.j2)
+
+```text
+You are EcoNest SensorAgent.
+Context: <task context>
+Sensor observations: <sensor observations>
+Detected issues: <sensor health issues>
+
+Provide:
+1. Sensor health assessment
+2. Likely cause of issues
+3. Calibration recommendations
+4. Maintenance recommendations
+
+Be concise.
+```
+
+### Scheduled autonomous-action decision
+
+**Trigger:** The background monitor at its configured interval. This is the
+only prompt that considers a possible automatic action. It receives a current
+home snapshot plus the allowed entity/action lists. Before Gemma sees the
+prompt, EcoNest's policy code prepares an unambiguous list of safe light
+turn-off targets. After Gemma answers, policy, capability, live-state, and
+Home Assistant result verification still run before any action executes.
+
+```text
+You are EcoNest's autonomous smart-home policy model. Decide whether EcoNest
+should execute exactly one low-risk action now.
+
+Safety rules:
+- Only recommend an action if confidence is high.
+- Only use allowed actions and entities.
+- Do not recommend climate, lock, garage, cover, alarm, or security actions.
+- The Pre-validated safe turn-off targets list was produced by EcoNest's
+  deterministic allowlist, state, and motion checks. It is not ambiguous. If
+  that list is non-empty, you MUST choose its first target: return
+  should_act=true, domain=light, action=turn_off, that entity_id,
+  risk_level=LOW, and confidence at least 0.85.
+- Prefer doing nothing if context is ambiguous.
+
+Allowed actions: <configured allowlist>
+Allowed entities: <configured entity allowlist>
+Pre-validated safe turn-off targets: <policy-approved targets>
+Feedback JSON: <current snapshot and measured feedback>
+
+Return JSON only.
+```
+
+If this model call fails, EcoNest may use a narrowly scoped policy fallback for
+an already pre-validated light turn-off target. MCP and Home Assistant checks
+are still mandatory, and the Autonomy page labels the recommendation source.
+
+## Sending user requests
+
+1. Open **User actions** and sign in.
+2. Type a request in ordinary language; an entity ID or action dropdown is not
+   required.
+3. EcoNest reads the live Home Assistant device inventory through MCP and
+   proposes an interpretation.
+4. Revise an incorrect interpretation, or confirm a correct one.
+5. After confirmation, EcoNest routes it to the appropriate agent.
+
+For a device command, the Device Agent runs the capability, policy, and live
+state checks before it calls Home Assistant. An energy or security request runs
+an advisory review only; it cannot change a device.
+
+## Autonomous recommendations and actions
+
+The background monitor runs at its configured interval and can form a low-risk
+recommendation from the current Home Assistant snapshot. Before execution,
+EcoNest checks the allowed action, exact allowlisted entity, confidence
+threshold, device capability, current state, and verified Home Assistant result.
+
+Recommendations remain visible in the Autonomy page even when automatic actions
+are disabled or a safety check stops them. That is expected and is not a failure.
+
+## Reading MCP Activity
+
+| Label | Meaning |
+| --- | --- |
+| `resource` | Read-only context, such as a live device inventory or defined home snapshot. |
+| `tool` | Approved operation, such as querying ArcadeDB, checking Home Assistant state, or calling a Home Assistant service. |
+| `energy`, `security`, `sensor`, `device` | Specialist agent that made the call. |
+| `orchestrator` | Coordinator that routed the task or recorded its result. |
+| `background_monitor` | Scheduled autonomous check rather than a Command Center request. |
+| `completed` / `failed` | Result of that individual MCP call. Check the final task outcome to determine whether a device action succeeded. |
+
+Raw queries and sensitive values are intentionally not displayed.
+
+## Running the stack
+
+From the repository root:
+
+```bash
+docker compose -f docker-compose.real.yml up -d
+docker compose -f docker-compose.real.yml ps
+poetry run poe test
+```
+
+Configuration and secrets remain in the local `.env` file and must not be
+committed. Home Assistant registry exports and real household data also remain
+outside git.
+
+### Connect Google Calendar (read-only household context)
+
+EcoNest includes a Google Calendar connection page at
+`/integrations/google-calendar`. It requests only the read-only Calendar events
+scope and stores OAuth credentials encrypted. It derives bounded `away` or
+`hosting` context windows rather than syncing event text into model prompts,
+and it never controls a device.
+
+Create a Google Cloud OAuth **Web application** client, add this callback URL
+(replace the host if EcoNest is deployed elsewhere), then add the following to
+the ignored local `.env` file:
+
+```env
+GOOGLE_CALENDAR_ENABLED=true
+GOOGLE_CALENDAR_CLIENT_ID=your-client-id.apps.googleusercontent.com
+GOOGLE_CALENDAR_CLIENT_SECRET=your-client-secret
+GOOGLE_CALENDAR_REDIRECT_URI=http://localhost:8001/integrations/google-calendar/callback
+# Generate once with: poetry run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+GOOGLE_CALENDAR_TOKEN_ENCRYPTION_KEY=your-fernet-key
+# Advisory-only calendar-context reviews; no Home Assistant actions are enabled by this.
+GOOGLE_CALENDAR_AUTONOMOUS_REVIEWS_ENABLED=true
+GOOGLE_CALENDAR_SYNC_INTERVAL_SECONDS=60
+```
+
+Use the actual externally reachable EcoNest URL as the redirect URI if the
+browser reaches EcoNest through another host or port. Recreate the orchestrator
+after updating `.env`:
+
+```bash
+docker compose -f docker-compose.real.yml up -d --no-deps orchestrator
+```
+
+Then open **Google Calendar** in the Launchpad and select **Connect Google
+Calendar**. Calendar event text is not treated as an instruction. EcoNest
+derives a bounded household context such as `hosting` or `away`, then supplies
+that context to recommendations and policies. An active relevant context can
+queue one energy and one security **advisory** review; it cannot authorize a
+Home Assistant service call.
+
+When `COMMAND_CENTER_AUTH_REQUIRED=false` for a local demo, set a random
+`GOOGLE_CALENDAR_SETUP_PASSPHRASE` too. It is required only to start the
+Calendar OAuth flow, and this demo path closes once a calendar is connected.
+Do not use it as a replacement for normal sign-in in a deployed environment.
+
+### Connect Gmail (metadata-only household notices)
+
+EcoNest also includes `/integrations/gmail`. Its normal mode uses the Gmail
+`gmail.metadata` OAuth scope only, which permits subject/from/date headers for
+selected messages but not message bodies or attachments. EcoNest reads those
+headers transiently, requires an explicit sender-domain allowlist, and stores
+only a hash plus a derived, short-lived `travel` or `utility` category.
+
+For a controlled local demonstration, set `GMAIL_READ_BODY_FOR_CONTEXT=true`
+and grant `https://www.googleapis.com/auth/gmail.readonly` instead. EcoNest
+then requests the selected allowlisted message in `full` format, extracts at
+most 8,000 characters of plain text transiently, and can derive explicit dates
+such as `October 12, 2026 to October 19, 2026`. It still does not retain raw
+bodies, headers, or attachments, and only the derived category, start/end
+window, and guidance reach agents or Gemma. This test mode must be reauthorized
+after adding the stronger scope, and should be disabled afterward.
+
+The Gmail API must be enabled in the same Google Cloud project. Add this
+redirect URI to the existing OAuth Web client:
+
+```text
+http://localhost:8001/integrations/gmail/callback
+```
+
+Then add these values to the ignored local `.env`. The Gmail client ID and
+secret may be omitted when the existing `GOOGLE_CALENDAR_CLIENT_ID` and
+`GOOGLE_CALENDAR_CLIENT_SECRET` refer to the same Google OAuth Web client.
+
+```env
+GMAIL_ENABLED=true
+GMAIL_REDIRECT_URI=http://localhost:8001/integrations/gmail/callback
+# Optional when reusing the Calendar OAuth client:
+GMAIL_CLIENT_ID=
+GMAIL_CLIENT_SECRET=
+# Use Gmail label IDs, not display names. INBOX is the safe default.
+GMAIL_ALLOWED_LABEL_IDS=INBOX
+# Required before syncing; do not use a broad domain unless you truly intend it.
+GMAIL_ALLOWED_SENDER_DOMAINS=travel.example.com,utility.example.com
+# Optional: otherwise the Calendar token-encryption key is reused.
+GMAIL_TOKEN_ENCRYPTION_KEY=
+GMAIL_CONTEXT_RETENTION_DAYS=14
+# Default false. Test-only: enables plain-text body date extraction and requires
+# the gmail.readonly OAuth scope instead of gmail.metadata.
+GMAIL_READ_BODY_FOR_CONTEXT=true
+```
+
+For the unauthenticated local demo, also set a separate random
+`GMAIL_SETUP_PASSPHRASE`. Open **Gmail** from the Launchpad, connect the
+account, then choose **Refresh context**. If no domain is allowlisted, the
+refresh fails closed and no Gmail metadata is processed.
+
+### Use the Apple GPU for Gemma on macOS
+
+Docker Desktop does not pass the Apple GPU through to the Ollama container. To
+run EcoNest's Gemma model on the Mac's Metal GPU while keeping the orchestrator
+and databases in Docker:
+
+1. Start the native Ollama macOS app and run `ollama pull gemma3:4b` on the Mac.
+2. Check that the orchestrator container can reach it:
+   `docker exec econest-real-orchestrator python -c "import urllib.request; print(urllib.request.urlopen('http://host.docker.internal:11434/api/version', timeout=5).read().decode())"`.
+3. Add `OLLAMA_URL=http://host.docker.internal:11434` to the ignored local
+   `.env` file. Keep `OLLAMA_MODEL=gemma3:4b` and
+   `OLLAMA_FALLBACK_MODEL=gemma3:4b`.
+4. Recreate **only** the orchestrator so Compose applies the new environment:
+   `docker compose -f docker-compose.real.yml up -d --no-deps orchestrator`.
+   A plain `restart` does not apply Compose environment changes.
+5. Send a safe read-only prompt, then run `ollama ps` on the Mac. Its
+   `PROCESSOR` column should report GPU use. Compare the response latency with
+   the CPU baseline; GPU acceleration alone does not guarantee a particular
+   end-to-end speedup.
+
+The existing Docker Ollama service remains installed as a fallback. To revert,
+remove the `OLLAMA_URL` line from `.env` and recreate only the orchestrator as
+in step 4. This does not delete models or database volumes. Native Ollama
+defaults to listening on localhost; do not expose its unauthenticated API to
+the public network.
+
+To reproduce the model-only CPU/GPU comparison shown at `/benchmarks`, run
+`python3 scripts/benchmark_ollama_backends.py` on the Mac, then refresh the
+report page. It sends the same generic, read-only prompt to Docker Ollama on
+port 11435 and native Ollama on port 11434, measuring one cold request and
+three warm requests on each. It temporarily unloads the model to measure cold
+starts; the next live request may need to load it again. These timings do not
+include EcoNest routing, databases, Home Assistant, or browser rendering.
+
+For an advisory workflow comparison that includes EcoNest routing, MCP data
+retrieval, model generation, and result polling, run:
+
+```bash
+docker exec econest-real-orchestrator poetry run python /app/scripts/benchmark_workflow_backends.py --samples 3 --output-dir /app/econest_exports/benchmarks
+```
+
+This creates temporary loopback-only API processes with background monitors,
+ingestion, and device actions disabled; it does not switch the live server.
+It asks only for an energy recommendation and stores timings without the
+household answer. The test preloads the model before each request, briefly
+unloading the native GPU model during the CPU phase, then restores it.
+The benchmark page also shows browser-side timings from the most recent
+completed User Prompts request in *that browser*. Those timings stay in browser
+storage and are not a controlled CPU/GPU comparison.
+
+## Repository map
+
+```text
+orchestrator/
+├── agents/       # Energy, Security, Sensor, and Device agents
+├── api/          # Browser pages and HTTP routes
+├── core/         # Database, policy, audit, security, and Home Assistant helpers
+├── graph/        # ArcadeDB graph models and sync helpers
+├── llm/          # Ollama client and prompts
+├── mcp/          # MCP resources, tools, server, and execution boundary
+├── static/       # Command Center, autonomy, MCP, monitor, schema, and demo pages
+├── training/     # Privacy-filtered fine-tuning dataset helpers
+└── tests/        # Automated tests
+```
